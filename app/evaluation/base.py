@@ -1,19 +1,23 @@
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from app.evaluation.quality_score import QualityScore
+from app.evaluation.quality_score import QualityEvaluation
 
 
 class BaseEvaluator(ABC):
     """
-    Compares an original model response with a candidate response and
-    returns a quality score representing how well the candidate matches.
+    Evaluates whether a candidate model response is a quality equivalent
+    of the original. Takes the original prompt as context.
+
+    Returns a QualityEvaluation with score, explanation, confidence, and flags.
     """
 
     @abstractmethod
     def evaluate(
         self,
-        original: str,
-        candidate: str,
+        prompt: str,
+        original_response: str,
+        candidate_response: str,
         task_type: Optional[str] = None,
-    ) -> QualityScore: ...
+        feedback: Optional[str] = None,
+    ) -> QualityEvaluation: ...

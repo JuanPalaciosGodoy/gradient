@@ -213,7 +213,12 @@ Phase 2 is fully functional locally — no real provider API calls required. The
 Implements the `GenerationProvider` interface without any external API calls. Uses MD5 hashing of `(prompt, model)` to return deterministic responses across runs. Pricing and latency are scaled by model tier from the catalog.
 
 **`HeuristicEvaluator`** (`app/evaluation/heuristic_evaluator.py`)
-Implements `BaseEvaluator` without any LLM calls. Scores candidate responses against originals using 70% Jaccard token overlap + 30% length ratio. Returns a `QualityScore` with `method="heuristic"`. Prometheus-based and LLM-judge evaluators are stubbed for future phases.
+The default evaluator — no LLM calls, no external APIs. Uses task-specific heuristics for all seven task types (summarization, classification, extraction, research, coding, customer support, other). Returns a `QualityEvaluation` with four fields: `score` (0.0–1.0), `explanation` (human-readable rationale), `confidence` (how reliable the score is for this task type), and `flags` (machine-readable signals such as `empty_response`, `research_conservative`, `missing_code_structure`). Research and coding scores are conservatively capped.
+
+Select via `EVALUATOR_MODE=heuristic` (default). Use `get_evaluator(mode)` from `app/evaluation/factory.py` for programmatic selection.
+
+**Prometheus / LLM judge evaluators** (`app/evaluation/prometheus_evaluator.py`, `app/evaluation/llm_judge_evaluator.py`)
+Clean stubs — raise `NotImplementedError` until real credentials and endpoints are wired. Each file documents the expected input format and output parsing contract for Phase 3 integration.
 
 **`ReplayRunner`** (`app/replay/replay_runner.py`)
 Accepts any `GenerationProvider` and `BaseEvaluator`. Runs every `ReplayRequest` against every enabled `ReplayCandidate`. Errors are captured per result and never abort the full run.
@@ -221,6 +226,8 @@ Accepts any `GenerationProvider` and `BaseEvaluator`. Runs every `ReplayRequest`
 Two construction helpers:
 - `build_replay_requests(records)` — builds from in-memory `UsageRecord` objects; assigns synthetic UUIDs (no DB traceability)
 - `build_replay_requests_from_rows(rows)` — builds from SQLite `usage_records` row dicts; uses the DB `id` as `original_record_id` for full traceability
+
+Both builders carry the original `feedback` signal (positive/negative/etc.) into `ReplayRequest.feedback`. The runner passes it to the evaluator, where it is available as context for future quality scoring improvements.
 
 **`ReplayReport` / `ModelReplaySummary`** (`app/replay/replay_report.py`)
 Pydantic models summarizing outcomes per candidate model: quality score, latency, cost, `success_count`, `coverage_rate`, and `estimated_annual_savings`. Savings are computed only against the subset of requests that had successful results for each candidate — failed calls never inflate savings figures.

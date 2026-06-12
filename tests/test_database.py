@@ -119,3 +119,135 @@ def test_lightweight_migration_preserves_existing_rows(tmp_path, monkeypatch):
     rows = conn.execute("SELECT * FROM migration_simulations WHERE scenario_name = 'legacy'").fetchall()
     conn.close()
     assert len(rows) == 1
+
+
+# ── Lightweight migration: replay_results quality columns ─────────────────────
+
+def _create_old_replay_results(db_path: str) -> None:
+    """Create replay_results as it existed before quality_explanation/confidence/flags were added."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE replay_runs (
+            replay_run_id TEXT PRIMARY KEY,
+            audit_run_id TEXT,
+            created_at TEXT NOT NULL,
+            candidate_models TEXT NOT NULL,
+            record_count INTEGER NOT NULL,
+            status TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE replay_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            replay_run_id TEXT NOT NULL,
+            replay_id TEXT NOT NULL,
+            original_record_id TEXT NOT NULL,
+            candidate_provider TEXT NOT NULL,
+            candidate_model TEXT NOT NULL,
+            candidate_response TEXT NOT NULL,
+            estimated_cost REAL NOT NULL,
+            latency_ms REAL NOT NULL,
+            quality_score REAL NOT NULL,
+            quality_method TEXT NOT NULL,
+            error_message TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def test_replay_results_quality_columns_added_by_migration(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "old_replay.db")
+    _create_old_replay_results(db_path)
+
+    assert "quality_explanation" not in _column_names(db_path, "replay_results")
+    assert "quality_confidence" not in _column_names(db_path, "replay_results")
+    assert "quality_flags" not in _column_names(db_path, "replay_results")
+
+    monkeypatch.setattr(settings, "database_path", db_path)
+    database.init_db()
+
+    cols = _column_names(db_path, "replay_results")
+    assert "quality_explanation" in cols
+    assert "quality_confidence" in cols
+    assert "quality_flags" in cols
+
+
+def test_replay_results_migration_idempotent(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "old_replay.db")
+    _create_old_replay_results(db_path)
+
+    monkeypatch.setattr(settings, "database_path", db_path)
+    database.init_db()
+    database.init_db()  # second call must not raise
+
+
+def test_replay_results_migration_preserves_existing_rows(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "old_replay.db")
+    _create_old_replay_results(db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """INSERT INTO replay_runs
+           (replay_run_id, created_at, candidate_models, record_count, status)
+           VALUES (?, ?, ?, ?, ?)""",
+        ("run-1", "2024-01-01T00:00:00+00:00", '["gpt-4o-mini"]', 1, "complete"),
+    )
+    conn.execute(
+        """INSERT INTO replay_results
+           (replay_run_id, replay_id, original_record_id, candidate_provider,
+            candidate_model, candidate_response, estimated_cost, latency_ms,
+            quality_score, quality_method)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("run-1", "r-1", "rec-1", "openai", "gpt-4o-mini",
+         "A response", 0.001, 200.0, 0.75, "heuristic"),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(settings, "database_path", db_path)
+    database.init_db()
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT * FROM replay_results WHERE replay_run_id = 'run-1'").fetchall()
+    conn.close()
+    assert len(rows) == 1
+
+
+def test_replay_results_migration_defaults_are_correct(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "old_replay.db")
+    _create_old_replay_results(db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """INSERT INTO replay_runs
+           (replay_run_id, created_at, candidate_models, record_count, status)
+           VALUES (?, ?, ?, ?, ?)""",
+        ("run-2", "2024-01-01T00:00:00+00:00", '["gpt-4o-mini"]', 1, "complete"),
+    )
+    conn.execute(
+        """INSERT INTO replay_results
+           (replay_run_id, replay_id, original_record_id, candidate_provider,
+            candidate_model, candidate_response, estimated_cost, latency_ms,
+            quality_score, quality_method)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("run-2", "r-2", "rec-2", "openai", "gpt-4o-mini",
+         "Response", 0.001, 100.0, 0.8, "heuristic"),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(settings, "database_path", db_path)
+    database.init_db()
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT quality_explanation, quality_confidence, quality_flags "
+        "FROM replay_results WHERE replay_run_id = 'run-2'"
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    explanation, confidence, flags = row
+    assert explanation == ""
+    assert confidence == 1.0
+    assert flags == "[]"

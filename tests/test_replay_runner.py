@@ -7,12 +7,14 @@ from datetime import datetime, timezone
 
 import pytest
 
+from app.evaluation.base import BaseEvaluator
 from app.evaluation.heuristic_evaluator import HeuristicEvaluator
+from app.evaluation.quality_score import QualityEvaluation
 from app.providers.base import GenerationProvider, ProviderResponse
 from app.providers.fake import FakeProvider
 from app.replay.replay_models import ReplayCandidate, ReplayRequest, REPLAY_CANDIDATES
 from app.replay.replay_runner import build_replay_requests, build_replay_requests_from_rows, ReplayRunner
-from app.replay.replay_store import get_replay_results, save_replay_results, save_replay_run
+from app.replay.replay_store import _decode_quality_flags, get_replay_results, save_replay_results, save_replay_run
 from app.schemas import TaskType, UsageRecord
 
 
@@ -80,6 +82,25 @@ def test_build_requests_includes_task_type():
     assert requests[0].task_type == "summarization"
 
 
+def test_build_requests_carries_feedback():
+    record = UsageRecord(
+        prompt="Summarize this",
+        response="A summary.",
+        timestamp=datetime(2024, 1, 15, tzinfo=timezone.utc),
+        model="gpt-4o",
+        cost=0.05,
+        task_type=TaskType.SUMMARIZATION,
+        feedback="positive",
+    )
+    requests = build_replay_requests([record])
+    assert requests[0].feedback == "positive"
+
+
+def test_build_requests_feedback_none_when_absent():
+    requests = build_replay_requests([_record("P")])
+    assert requests[0].feedback is None
+
+
 # ── build_replay_requests_from_rows ──────────────────────────────────────────
 
 def test_build_from_rows_uses_db_id():
@@ -144,6 +165,31 @@ def test_build_from_rows_preserves_task_type():
     ]
     requests = build_replay_requests_from_rows(rows)
     assert requests[0].task_type == "coding"
+
+
+def test_build_from_rows_carries_feedback():
+    rows = [
+        {
+            "id": 1, "prompt": "P", "response": "R",
+            "model": "gpt-4o", "cost": 0.01, "task_type": None,
+            "feedback": "negative",
+            "timestamp": "2024-01-15T00:00:00+00:00",
+        }
+    ]
+    requests = build_replay_requests_from_rows(rows)
+    assert requests[0].feedback == "negative"
+
+
+def test_build_from_rows_feedback_none_when_absent():
+    rows = [
+        {
+            "id": 1, "prompt": "P", "response": "R",
+            "model": "gpt-4o", "cost": 0.01, "task_type": None,
+            "timestamp": "2024-01-15T00:00:00+00:00",
+        }
+    ]
+    requests = build_replay_requests_from_rows(rows)
+    assert requests[0].feedback is None
 
 
 # ── FakeProvider ──────────────────────────────────────────────────────────────
@@ -299,6 +345,57 @@ def test_mixed_providers_partial_failure():
     assert bad.error_message is not None
 
 
+# ── Feedback reaches evaluator ────────────────────────────────────────────────
+
+class _FeedbackCapturingEvaluator(BaseEvaluator):
+    """Spy evaluator that records the feedback argument it received."""
+
+    def __init__(self):
+        self.last_feedback = "NOT_CALLED"
+
+    def evaluate(self, prompt, original_response, candidate_response, task_type=None, feedback=None):
+        self.last_feedback = feedback
+        return QualityEvaluation(
+            score=0.8, method="heuristic",
+            explanation="spy", confidence=0.8, flags=[],
+        )
+
+
+def test_runner_passes_feedback_to_evaluator():
+    spy = _FeedbackCapturingEvaluator()
+    runner = ReplayRunner(provider=FakeProvider(), evaluator=spy)
+    record = UsageRecord(
+        prompt="Summarize this",
+        response="A summary.",
+        timestamp=datetime(2024, 1, 15, tzinfo=timezone.utc),
+        model="gpt-4o",
+        cost=0.05,
+        task_type=TaskType.SUMMARIZATION,
+        feedback="positive",
+    )
+    requests = build_replay_requests([record])
+    candidate = ReplayCandidate(
+        provider="openai", model="gpt-4o-mini", model_group="cheap",
+        estimated_input_cost_per_1k_tokens=0.00015,
+        estimated_output_cost_per_1k_tokens=0.0006,
+    )
+    runner.run(requests, [candidate])
+    assert spy.last_feedback == "positive"
+
+
+def test_runner_passes_none_feedback_when_absent():
+    spy = _FeedbackCapturingEvaluator()
+    runner = ReplayRunner(provider=FakeProvider(), evaluator=spy)
+    requests = build_replay_requests([_record("P")])
+    candidate = ReplayCandidate(
+        provider="openai", model="gpt-4o-mini", model_group="cheap",
+        estimated_input_cost_per_1k_tokens=0.00015,
+        estimated_output_cost_per_1k_tokens=0.0006,
+    )
+    runner.run(requests, [candidate])
+    assert spy.last_feedback is None
+
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 
 def test_replay_results_are_persisted(db, runner, two_candidates):
@@ -334,3 +431,50 @@ def test_replay_results_have_correct_run_id(db, runner, two_candidates):
     persisted = get_replay_results(replay_run_id)
     for row in persisted:
         assert row["replay_run_id"] == replay_run_id
+
+
+def test_quality_flags_round_trip(db, runner, two_candidates):
+    """quality_flags saved as JSON are decoded back to a Python list on read."""
+    replay_run_id = str(uuid.uuid4())
+    requests = build_replay_requests([_record("P")])
+    results = runner.run(requests, two_candidates)
+
+    save_replay_run(
+        replay_run_id=replay_run_id,
+        audit_run_id=None,
+        candidate_models=[c.model for c in two_candidates],
+        record_count=len(requests),
+    )
+    save_replay_results(replay_run_id, results)
+
+    persisted = get_replay_results(replay_run_id)
+    for row in persisted:
+        assert isinstance(row["quality_flags"], list)
+
+
+# ── _decode_quality_flags edge cases ─────────────────────────────────────────
+
+def test_decode_flags_valid_list():
+    assert _decode_quality_flags('["empty_response", "short_response"]') == [
+        "empty_response", "short_response"
+    ]
+
+
+def test_decode_flags_null_returns_empty_list():
+    assert _decode_quality_flags(None) == []
+
+
+def test_decode_flags_malformed_json_returns_empty_list():
+    assert _decode_quality_flags("{not valid json!!!}") == []
+
+
+def test_decode_flags_valid_json_non_list_string_returns_empty_list():
+    assert _decode_quality_flags('"just_a_string"') == []
+
+
+def test_decode_flags_valid_json_dict_returns_empty_list():
+    assert _decode_quality_flags('{"flag": "value"}') == []
+
+
+def test_decode_flags_empty_list_string():
+    assert _decode_quality_flags("[]") == []

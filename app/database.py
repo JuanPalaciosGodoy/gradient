@@ -30,6 +30,9 @@ def _run_lightweight_migrations(conn: sqlite3.Connection) -> None:
     """Idempotent column additions for databases created before a schema change."""
     _ensure_column(conn, "migration_simulations", "audit_run_id", "TEXT")
     _ensure_column(conn, "migration_simulations", "replay_run_id", "TEXT")
+    _ensure_column(conn, "replay_results", "quality_explanation", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "replay_results", "quality_confidence", "REAL NOT NULL DEFAULT 1.0")
+    _ensure_column(conn, "replay_results", "quality_flags", "TEXT NOT NULL DEFAULT '[]'")
 
 
 def init_db() -> None:
@@ -88,6 +91,9 @@ def init_db() -> None:
                 latency_ms REAL NOT NULL,
                 quality_score REAL NOT NULL,
                 quality_method TEXT NOT NULL,
+                quality_explanation TEXT NOT NULL DEFAULT '',
+                quality_confidence REAL NOT NULL DEFAULT 1.0,
+                quality_flags TEXT NOT NULL DEFAULT '[]',
                 error_message TEXT,
                 FOREIGN KEY (replay_run_id) REFERENCES replay_runs(replay_run_id)
             )

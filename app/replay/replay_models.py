@@ -7,7 +7,7 @@ These models represent the counterfactual question:
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class ReplayCandidate(BaseModel):
@@ -45,6 +45,7 @@ class ReplayRequest(BaseModel):
     original_model: str
     original_cost: float
     task_type: Optional[str] = None
+    feedback: Optional[str] = None  # original user feedback signal, carried for evaluator context
     timestamp: datetime
 
 
@@ -58,9 +59,19 @@ class ReplayResult(BaseModel):
     candidate_response: str
     estimated_cost: float
     latency_ms: float
-    quality_score: float   # 0.0–1.0; populated from evaluator
-    quality_method: str    # heuristic | prometheus | llm_judge | error
+    quality_score: float          # 0.0–1.0; populated from evaluator
+    quality_method: str           # heuristic | prometheus | llm_judge | error
+    quality_explanation: str = ""
+    quality_confidence: float = 1.0
+    quality_flags: list[str] = Field(default_factory=list)
     error_message: Optional[str] = None
+
+    @field_validator("quality_score", "quality_confidence")
+    @classmethod
+    def must_be_in_unit_range(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("must be between 0.0 and 1.0")
+        return v
 
 
 class MigrationScenario(BaseModel):

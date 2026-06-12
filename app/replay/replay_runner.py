@@ -32,6 +32,7 @@ def build_replay_requests(records: list[UsageRecord]) -> list[ReplayRequest]:
             original_model=record.model,
             original_cost=record.cost,
             task_type=record.task_type.value if record.task_type else None,
+            feedback=record.feedback,
             timestamp=record.timestamp,
         ))
     return requests
@@ -52,6 +53,7 @@ def build_replay_requests_from_rows(rows: list[dict]) -> list[ReplayRequest]:
             original_model=row["model"],
             original_cost=row["cost"],
             task_type=row.get("task_type"),
+            feedback=row.get("feedback"),
             timestamp=datetime.fromisoformat(row["timestamp"]),
         ))
     return requests
@@ -86,9 +88,11 @@ class ReplayRunner:
         try:
             response = self.provider.generate(req.prompt, candidate.model)
             quality = self.evaluator.evaluate(
-                req.original_response,
-                response.text,
-                req.task_type,
+                prompt=req.prompt,
+                original_response=req.original_response,
+                candidate_response=response.text,
+                task_type=req.task_type,
+                feedback=req.feedback,
             )
             return ReplayResult(
                 replay_id=replay_id,
@@ -100,6 +104,9 @@ class ReplayRunner:
                 latency_ms=response.latency_ms,
                 quality_score=quality.score,
                 quality_method=quality.method,
+                quality_explanation=quality.explanation,
+                quality_confidence=quality.confidence,
+                quality_flags=quality.flags,
                 error_message=None,
             )
         except Exception as exc:
@@ -113,5 +120,8 @@ class ReplayRunner:
                 latency_ms=0.0,
                 quality_score=0.0,
                 quality_method="error",
+                quality_explanation=f"Evaluation failed: {exc}",
+                quality_confidence=0.0,
+                quality_flags=["evaluation_error"],
                 error_message=str(exc),
             )

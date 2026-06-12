@@ -239,3 +239,75 @@ def test_migration_simulation_result_creation():
     )
     assert result.estimated_annual_savings == 30_000.0
     assert result.recommendation == "proceed"
+
+
+# ── ReplayResult validation ───────────────────────────────────────────────────
+
+def _base_result(**overrides) -> dict:
+    base = dict(
+        replay_id="r1", original_record_id="rec-1",
+        candidate_provider="openai", candidate_model="gpt-4o-mini",
+        candidate_response="ok", estimated_cost=0.001, latency_ms=200.0,
+        quality_score=0.8, quality_method="heuristic",
+    )
+    base.update(overrides)
+    return base
+
+
+def test_replay_result_quality_score_below_zero_raises():
+    with pytest.raises(Exception):
+        ReplayResult(**_base_result(quality_score=-0.1))
+
+
+def test_replay_result_quality_score_above_one_raises():
+    with pytest.raises(Exception):
+        ReplayResult(**_base_result(quality_score=1.5))
+
+
+def test_replay_result_quality_confidence_below_zero_raises():
+    with pytest.raises(Exception):
+        ReplayResult(**_base_result(quality_confidence=-0.1))
+
+
+def test_replay_result_quality_confidence_above_one_raises():
+    with pytest.raises(Exception):
+        ReplayResult(**_base_result(quality_confidence=1.1))
+
+
+def test_replay_result_quality_score_boundary_values_valid():
+    r0 = ReplayResult(**_base_result(quality_score=0.0))
+    r1 = ReplayResult(**_base_result(quality_score=1.0))
+    assert r0.quality_score == 0.0
+    assert r1.quality_score == 1.0
+
+
+def test_replay_result_quality_flags_are_independent_instances():
+    r1 = ReplayResult(**_base_result())
+    r2 = ReplayResult(**_base_result())
+    r1.quality_flags.append("test_flag")
+    assert "test_flag" not in r2.quality_flags
+
+
+def test_replay_result_feedback_carried_in_request():
+    req = ReplayRequest(
+        original_record_id="rec-1",
+        prompt="Summarize",
+        original_response="A summary.",
+        original_model="gpt-4o",
+        original_cost=0.05,
+        feedback="positive",
+        timestamp=datetime(2024, 1, 15, tzinfo=timezone.utc),
+    )
+    assert req.feedback == "positive"
+
+
+def test_replay_request_feedback_defaults_to_none():
+    req = ReplayRequest(
+        original_record_id="rec-2",
+        prompt="Summarize",
+        original_response="A summary.",
+        original_model="gpt-4o",
+        original_cost=0.05,
+        timestamp=datetime(2024, 1, 15, tzinfo=timezone.utc),
+    )
+    assert req.feedback is None
