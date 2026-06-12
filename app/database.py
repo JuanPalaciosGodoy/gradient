@@ -33,6 +33,11 @@ def _run_lightweight_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "replay_results", "quality_explanation", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "replay_results", "quality_confidence", "REAL NOT NULL DEFAULT 1.0")
     _ensure_column(conn, "replay_results", "quality_flags", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "migration_simulations", "avg_current_quality", "REAL NOT NULL DEFAULT 0.0")
+    _ensure_column(conn, "migration_simulations", "avg_simulated_quality", "REAL NOT NULL DEFAULT 0.0")
+    _ensure_column(conn, "migration_simulations", "avg_latency_delta_ms", "REAL NOT NULL DEFAULT 0.0")
+    _ensure_column(conn, "migration_simulations", "records_analyzed", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "migration_simulations", "failed_replays", "INTEGER NOT NULL DEFAULT 0")
 
 
 def init_db() -> None:
@@ -114,7 +119,12 @@ def init_db() -> None:
                 average_quality_delta REAL NOT NULL,
                 confidence_score REAL NOT NULL,
                 recommendation TEXT NOT NULL,
-                rationale TEXT NOT NULL
+                rationale TEXT NOT NULL,
+                avg_current_quality REAL NOT NULL DEFAULT 0.0,
+                avg_simulated_quality REAL NOT NULL DEFAULT 0.0,
+                avg_latency_delta_ms REAL NOT NULL DEFAULT 0.0,
+                records_analyzed INTEGER NOT NULL DEFAULT 0,
+                failed_replays INTEGER NOT NULL DEFAULT 0
             )
         """)
         _run_lightweight_migrations(conn)
@@ -175,6 +185,41 @@ def save_report(report) -> None:
                VALUES (?, ?, ?, ?)""",
             (report.report_id, report.audit_run_id, report.generated_at.isoformat(), report.model_dump_json()),
         )
+
+
+def delete_migration_simulations_for_replay_run(replay_run_id: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM migration_simulations WHERE replay_run_id = ?",
+            (replay_run_id,),
+        )
+
+
+def get_migration_simulations_for_replay_run(replay_run_id: str) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM migration_simulations WHERE replay_run_id = ? ORDER BY estimated_annual_savings DESC",
+            (replay_run_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def count_replay_results(replay_run_id: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM replay_results WHERE replay_run_id = ?",
+            (replay_run_id,),
+        ).fetchone()
+        return row[0] if row else 0
+
+
+def get_replay_run(replay_run_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM replay_runs WHERE replay_run_id = ?",
+            (replay_run_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def get_report(audit_run_id: str):

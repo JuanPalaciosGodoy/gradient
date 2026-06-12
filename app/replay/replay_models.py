@@ -107,8 +107,14 @@ class MigrationSimulationResult(BaseModel):
     estimated_savings_pct: float      # 0–100
     average_quality_delta: float      # negative = quality loss; positive = quality gain
     confidence_score: float           # 0.0–1.0
-    recommendation: str               # proceed | hold | investigate
+    recommendation: str               # migrate | controlled_pilot | no_migration | hold | investigate | proceed
     rationale: str
+    # Evidence-based fields (populated by simulate_from_replay_data; default 0 for catalog-based)
+    avg_current_quality: float = 0.0
+    avg_simulated_quality: float = 0.0
+    avg_latency_delta_ms: float = 0.0   # average candidate latency (original latency not tracked)
+    records_analyzed: int = 0
+    failed_replays: int = 0
 
 
 # ── Candidate catalog ─────────────────────────────────────────────────────────

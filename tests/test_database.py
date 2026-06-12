@@ -214,6 +214,44 @@ def test_replay_results_migration_preserves_existing_rows(tmp_path, monkeypatch)
     assert len(rows) == 1
 
 
+# ── Lightweight migration: migration_simulations evidence columns ─────────────
+
+def test_migration_simulations_has_evidence_columns(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "database_path", str(tmp_path / "test.db"))
+    database.init_db()
+    cols = _column_names(str(tmp_path / "test.db"), "migration_simulations")
+    assert "avg_current_quality" in cols
+    assert "avg_simulated_quality" in cols
+    assert "avg_latency_delta_ms" in cols
+    assert "records_analyzed" in cols
+    assert "failed_replays" in cols
+
+
+def test_migration_simulations_evidence_columns_added_by_migration(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "old_ms.db")
+    _create_old_migration_simulations(db_path)
+
+    for col in ("avg_current_quality", "avg_simulated_quality", "avg_latency_delta_ms",
+                "records_analyzed", "failed_replays"):
+        assert col not in _column_names(db_path, "migration_simulations")
+
+    monkeypatch.setattr(settings, "database_path", db_path)
+    database.init_db()
+
+    cols = _column_names(db_path, "migration_simulations")
+    assert "avg_current_quality" in cols
+    assert "records_analyzed" in cols
+    assert "failed_replays" in cols
+
+
+def test_migration_simulations_evidence_migration_idempotent(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "old_ms2.db")
+    _create_old_migration_simulations(db_path)
+    monkeypatch.setattr(settings, "database_path", db_path)
+    database.init_db()
+    database.init_db()  # second call must not raise
+
+
 def test_replay_results_migration_defaults_are_correct(tmp_path, monkeypatch):
     db_path = str(tmp_path / "old_replay.db")
     _create_old_replay_results(db_path)

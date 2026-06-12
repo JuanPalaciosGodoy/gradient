@@ -80,6 +80,8 @@ class ReplayRunner:
             for candidate in candidates:
                 if not candidate.enabled:
                     continue
+                if candidate.model == req.original_model:
+                    continue  # never compare a model against itself
                 results.append(self._run_single(req, candidate))
         return results
 

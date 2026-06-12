@@ -478,3 +478,79 @@ def test_decode_flags_valid_json_dict_returns_empty_list():
 
 def test_decode_flags_empty_list_string():
     assert _decode_quality_flags("[]") == []
+
+
+# ── Self-migration prevention ─────────────────────────────────────────────────
+
+def test_runner_skips_self_candidate(runner):
+    """No result when candidate.model == req.original_model."""
+    req = ReplayRequest(
+        original_record_id="r-1",
+        prompt="Summarize this quarterly report.",
+        original_response="Summary here.",
+        original_model="gpt-4o",
+        original_cost=0.05,
+        task_type="summarization",
+        timestamp=datetime(2024, 1, 15, tzinfo=timezone.utc),
+    )
+    self_candidate = ReplayCandidate(
+        provider="openai", model="gpt-4o", model_group="frontier",
+        estimated_input_cost_per_1k_tokens=0.005,
+        estimated_output_cost_per_1k_tokens=0.015,
+    )
+    other_candidate = ReplayCandidate(
+        provider="openai", model="gpt-4o-mini", model_group="cheap",
+        estimated_input_cost_per_1k_tokens=0.00015,
+        estimated_output_cost_per_1k_tokens=0.0006,
+    )
+    results = runner.run([req], [self_candidate, other_candidate])
+    assert len(results) == 1
+    assert results[0].candidate_model == "gpt-4o-mini"
+
+
+def test_runner_only_self_candidate_produces_no_results(runner):
+    """When the only candidate is the source model, runner returns empty list."""
+    req = ReplayRequest(
+        original_record_id="r-1",
+        prompt="Write a Python function.",
+        original_response="def foo(): pass",
+        original_model="claude-3-5-sonnet-20241022",
+        original_cost=0.10,
+        task_type="coding",
+        timestamp=datetime(2024, 1, 15, tzinfo=timezone.utc),
+    )
+    self_candidate = ReplayCandidate(
+        provider="anthropic", model="claude-3-5-sonnet-20241022", model_group="balanced",
+        estimated_input_cost_per_1k_tokens=0.003,
+        estimated_output_cost_per_1k_tokens=0.015,
+    )
+    results = runner.run([req], [self_candidate])
+    assert results == []
+
+
+def test_runner_no_result_has_same_source_and_target(runner, two_candidates):
+    """For all results across multiple requests, candidate != original model."""
+    # First record uses claude-3-haiku (which IS in two_candidates) as source
+    req1 = ReplayRequest(
+        original_record_id="r-haiku",
+        prompt="Summarize this.",
+        original_response="Summary.",
+        original_model="claude-3-haiku-20240307",
+        original_cost=0.05,
+        task_type="summarization",
+        timestamp=datetime(2024, 1, 15, tzinfo=timezone.utc),
+    )
+    req2 = ReplayRequest(
+        original_record_id="r-gpt4o",
+        prompt="Classify this ticket.",
+        original_response="billing",
+        original_model="gpt-4o",
+        original_cost=0.03,
+        task_type="classification",
+        timestamp=datetime(2024, 1, 15, tzinfo=timezone.utc),
+    )
+    req_by_id = {"r-haiku": req1, "r-gpt4o": req2}
+    results = runner.run([req1, req2], two_candidates)
+    for r in results:
+        orig_model = req_by_id[r.original_record_id].original_model
+        assert r.candidate_model != orig_model
