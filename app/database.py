@@ -19,6 +19,19 @@ def get_connection():
         conn.close()
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    """Add `column` to `table` if it does not already exist."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _run_lightweight_migrations(conn: sqlite3.Connection) -> None:
+    """Idempotent column additions for databases created before a schema change."""
+    _ensure_column(conn, "migration_simulations", "audit_run_id", "TEXT")
+    _ensure_column(conn, "migration_simulations", "replay_run_id", "TEXT")
+
+
 def init_db() -> None:
     with get_connection() as conn:
         conn.execute("""
@@ -52,6 +65,53 @@ def init_db() -> None:
                 report_json TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS replay_runs (
+                replay_run_id TEXT PRIMARY KEY,
+                audit_run_id TEXT,
+                created_at TEXT NOT NULL,
+                candidate_models TEXT NOT NULL,
+                record_count INTEGER NOT NULL,
+                status TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS replay_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                replay_run_id TEXT NOT NULL,
+                replay_id TEXT NOT NULL,
+                original_record_id TEXT NOT NULL,
+                candidate_provider TEXT NOT NULL,
+                candidate_model TEXT NOT NULL,
+                candidate_response TEXT NOT NULL,
+                estimated_cost REAL NOT NULL,
+                latency_ms REAL NOT NULL,
+                quality_score REAL NOT NULL,
+                quality_method TEXT NOT NULL,
+                error_message TEXT,
+                FOREIGN KEY (replay_run_id) REFERENCES replay_runs(replay_run_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS migration_simulations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                audit_run_id TEXT,
+                replay_run_id TEXT,
+                scenario_name TEXT NOT NULL,
+                source_model TEXT NOT NULL,
+                target_model TEXT NOT NULL,
+                current_annualized_cost REAL NOT NULL,
+                simulated_annualized_cost REAL NOT NULL,
+                estimated_annual_savings REAL NOT NULL,
+                estimated_savings_pct REAL NOT NULL,
+                average_quality_delta REAL NOT NULL,
+                confidence_score REAL NOT NULL,
+                recommendation TEXT NOT NULL,
+                rationale TEXT NOT NULL
+            )
+        """)
+        _run_lightweight_migrations(conn)
 
 
 def save_audit_run(run_id: str, file_name: str, record_count: int, status: str = "complete") -> None:

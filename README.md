@@ -200,3 +200,50 @@ Phase 1 savings estimates are heuristic: conservative rates derived from model t
 Phase 2 replaces those estimates with evidence. It will run a sample of your historical prompts against cheaper candidate models and compare output quality. Instead of saying "summarization typically saves 45%," Gradient will *show you* whether `claude-3-5-sonnet` produces acceptable summaries for your specific workload — and quantify the quality tradeoff.
 
 This is what makes it a procurement tool, not a token dashboard.
+
+---
+
+## Phase 2: Local Replay Scaffold
+
+Phase 2 is fully functional locally — no real provider API calls required. The components below work together as a deterministic simulation layer.
+
+### Key components
+
+**`FakeProvider`** (`app/providers/fake.py`)
+Implements the `GenerationProvider` interface without any external API calls. Uses MD5 hashing of `(prompt, model)` to return deterministic responses across runs. Pricing and latency are scaled by model tier from the catalog.
+
+**`HeuristicEvaluator`** (`app/evaluation/heuristic_evaluator.py`)
+Implements `BaseEvaluator` without any LLM calls. Scores candidate responses against originals using 70% Jaccard token overlap + 30% length ratio. Returns a `QualityScore` with `method="heuristic"`. Prometheus-based and LLM-judge evaluators are stubbed for future phases.
+
+**`ReplayRunner`** (`app/replay/replay_runner.py`)
+Accepts any `GenerationProvider` and `BaseEvaluator`. Runs every `ReplayRequest` against every enabled `ReplayCandidate`. Errors are captured per result and never abort the full run.
+
+Two construction helpers:
+- `build_replay_requests(records)` — builds from in-memory `UsageRecord` objects; assigns synthetic UUIDs (no DB traceability)
+- `build_replay_requests_from_rows(rows)` — builds from SQLite `usage_records` row dicts; uses the DB `id` as `original_record_id` for full traceability
+
+**`ReplayReport` / `ModelReplaySummary`** (`app/replay/replay_report.py`)
+Pydantic models summarizing outcomes per candidate model: quality score, latency, cost, `success_count`, `coverage_rate`, and `estimated_annual_savings`. Savings are computed only against the subset of requests that had successful results for each candidate — failed calls never inflate savings figures.
+
+**`MigrationSimulator`** (`app/replay/migration_simulator.py`)
+Estimates annual savings from a proposed model migration using catalog pricing ratios. Filters by `source_model` and `task_types_included`. Outputs a `MigrationSimulationResult` with `confidence_score` and `recommendation` (`proceed` / `hold` / `investigate`). No LLM calls; confidence is heuristic (record volume + catalog coverage).
+
+### Run a local replay
+
+```python
+from app.providers.fake import FakeProvider
+from app.evaluation.heuristic_evaluator import HeuristicEvaluator
+from app.replay.replay_runner import ReplayRunner, build_replay_requests
+from app.replay.replay_report import build_replay_report
+from app.replay.replay_models import REPLAY_CANDIDATES
+
+runner = ReplayRunner(provider=FakeProvider(), evaluator=HeuristicEvaluator())
+requests = build_replay_requests(usage_records)
+results = runner.run(requests, REPLAY_CANDIDATES)
+report = build_replay_report("run-001", requests, results, date_range_days=30)
+
+for s in report.model_summaries:
+    print(f"{s.model}: savings=${s.estimated_annual_savings:.0f}/yr  quality={s.avg_quality_score:.2f}  coverage={s.coverage_rate:.0%}")
+```
+
+Swap `FakeProvider` for a real provider implementation when you have API credentials. The rest of the pipeline is unchanged.
