@@ -7,6 +7,12 @@ VALID_CSV = b"""prompt,response,timestamp,model,cost
 "Classify this ticket","Category: billing",2024-01-16 10:00:00,gpt-4o-mini,0.0012
 """
 
+# All records use gpt-4o; used to trigger self-candidate rejection
+GPT4O_ONLY_CSV = b"""prompt,response,timestamp,model,cost
+"Summarize this report","Summary here",2024-01-15 09:00:00,gpt-4o,0.0342
+"Classify this ticket","Category: billing",2024-01-16 10:00:00,gpt-4o,0.0012
+"""
+
 
 def _upload(client, content: bytes, filename: str = "data.csv"):
     return client.post(
@@ -326,3 +332,370 @@ def test_markdown_has_replay_validation_language(client):
     run_id = _upload_and_generate(client)
     md = client.get(f"/audits/{run_id}/report/markdown").text
     assert "replay" in md.lower()
+
+
+# ── Replay run endpoint ───────────────────────────────────────────────────────
+
+def _run_replay(client, audit_run_id: str, body: dict | None = None):
+    return client.post(
+        f"/audits/{audit_run_id}/replay/run",
+        json=body or {},
+    )
+
+
+def test_replay_run_returns_200(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id)
+    assert resp.status_code == 200
+
+
+def test_replay_run_returns_run_id(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    data = _run_replay(client, run_id).json()
+    assert "replay_run_id" in data
+    assert len(data["replay_run_id"]) > 0
+
+
+def test_replay_run_returns_records_selected(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    data = _run_replay(client, run_id).json()
+    assert "records_selected" in data
+    assert data["records_selected"] == 2  # VALID_CSV has 2 rows
+
+
+def test_replay_run_returns_candidates_selected(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    data = _run_replay(client, run_id).json()
+    assert "candidates_selected" in data
+    assert isinstance(data["candidates_selected"], list)
+    assert len(data["candidates_selected"]) > 0
+
+
+def test_replay_run_status_is_complete(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    data = _run_replay(client, run_id).json()
+    assert data["status"] == "complete"
+
+
+def test_replay_run_not_found_returns_404(client):
+    resp = _run_replay(client, "nonexistent-audit-id")
+    assert resp.status_code == 404
+
+
+def test_replay_run_with_max_records(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    data = _run_replay(client, run_id, {"max_records": 1}).json()
+    assert data["records_selected"] == 1
+
+
+def test_replay_run_with_candidate_models(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    data = _run_replay(client, run_id, {"candidate_models": ["gpt-4o-mini"]}).json()
+    assert data["candidates_selected"] == ["gpt-4o-mini"]
+
+
+# ── Simulate endpoint ─────────────────────────────────────────────────────────
+
+def _upload_and_replay(client, content: bytes = VALID_CSV):
+    run_id = _upload(client, content).json()["audit_run_id"]
+    replay_id = _run_replay(client, run_id).json()["replay_run_id"]
+    return run_id, replay_id
+
+
+def _upload_replay_simulate(client, content: bytes = VALID_CSV):
+    run_id, replay_id = _upload_and_replay(client, content)
+    client.post(f"/replay/{replay_id}/simulate")
+    return run_id, replay_id
+
+
+def test_simulate_returns_200(client):
+    _, replay_id = _upload_and_replay(client)
+    resp = client.post(f"/replay/{replay_id}/simulate")
+    assert resp.status_code == 200
+
+
+def test_simulate_returns_simulations_count(client):
+    _, replay_id = _upload_and_replay(client)
+    data = client.post(f"/replay/{replay_id}/simulate").json()
+    assert "simulations_count" in data
+    assert isinstance(data["simulations_count"], int)
+    assert data["simulations_count"] >= 0
+
+
+def test_simulate_returns_top_scenarios(client):
+    _, replay_id = _upload_and_replay(client)
+    data = client.post(f"/replay/{replay_id}/simulate").json()
+    assert "top_scenarios" in data
+    assert isinstance(data["top_scenarios"], list)
+
+
+def test_simulate_not_found_returns_404(client):
+    resp = client.post("/replay/nonexistent-id/simulate")
+    assert resp.status_code == 404
+
+
+def test_simulate_replay_run_id_in_response(client):
+    _, replay_id = _upload_and_replay(client)
+    data = client.post(f"/replay/{replay_id}/simulate").json()
+    assert data["replay_run_id"] == replay_id
+
+
+def test_simulate_twice_no_duplicate_rows(client):
+    _, replay_id = _upload_and_replay(client)
+    client.post(f"/replay/{replay_id}/simulate")
+
+    from app.database import get_migration_simulations_for_replay_run
+    count_after_first = len(get_migration_simulations_for_replay_run(replay_id))
+
+    client.post(f"/replay/{replay_id}/simulate")
+    count_after_second = len(get_migration_simulations_for_replay_run(replay_id))
+
+    assert count_after_first == count_after_second
+    assert count_after_first > 0
+
+
+# ── Replay report endpoints ───────────────────────────────────────────────────
+
+def test_replay_report_returns_200(client):
+    _, replay_id = _upload_replay_simulate(client)
+    resp = client.get(f"/replay/{replay_id}/report")
+    assert resp.status_code == 200
+
+
+def test_replay_report_has_required_fields(client):
+    _, replay_id = _upload_replay_simulate(client)
+    data = client.get(f"/replay/{replay_id}/report").json()
+    assert "replay_run_id" in data
+    assert "executive_summary" in data
+    assert "recommended_migrations" in data
+    assert "do_not_migrate" in data
+    assert "risk_notes" in data
+    assert "next_actions" in data
+    assert "current_annualized_spend" in data
+    assert "estimated_annual_savings" in data
+    assert "overall_confidence" in data
+
+
+def test_replay_report_before_simulate_returns_422(client):
+    _, replay_id = _upload_and_replay(client)
+    resp = client.get(f"/replay/{replay_id}/report")
+    assert resp.status_code == 422
+    assert "simulate" in resp.json()["detail"].lower()
+
+
+def test_replay_report_not_found_returns_404(client):
+    resp = client.get("/replay/nonexistent-id/report")
+    assert resp.status_code == 404
+
+
+def test_replay_report_markdown_returns_200(client):
+    _, replay_id = _upload_replay_simulate(client)
+    resp = client.get(f"/replay/{replay_id}/report/markdown")
+    assert resp.status_code == 200
+
+
+def test_replay_report_markdown_is_text(client):
+    _, replay_id = _upload_replay_simulate(client)
+    resp = client.get(f"/replay/{replay_id}/report/markdown")
+    assert "text/plain" in resp.headers["content-type"]
+
+
+def test_replay_report_markdown_has_required_sections(client):
+    _, replay_id = _upload_replay_simulate(client)
+    md = client.get(f"/replay/{replay_id}/report/markdown").text
+    assert "# Gradient Replay Analysis" in md
+    assert "## Executive Summary" in md
+    assert "## Recommended Migrations" in md
+    assert "## Do Not Migrate" in md
+    assert "## Risk Notes" in md
+    assert "## Next Actions" in md
+
+
+def test_replay_report_markdown_before_simulate_returns_422(client):
+    _, replay_id = _upload_and_replay(client)
+    resp = client.get(f"/replay/{replay_id}/report/markdown")
+    assert resp.status_code == 422
+
+
+def test_replay_report_markdown_not_found_returns_404(client):
+    resp = client.get("/replay/nonexistent-id/report/markdown")
+    assert resp.status_code == 404
+
+
+# ── Self-migration prevention ─────────────────────────────────────────────────
+
+def test_no_self_migration_in_simulation_scenarios(client):
+    """Simulation scenarios must not have source_model == target_model."""
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    # Include both models from VALID_CSV as explicit candidates
+    replay_id = _run_replay(
+        client, run_id, {"candidate_models": ["gpt-4o", "gpt-4o-mini", "claude-3-haiku-20240307"]}
+    ).json()["replay_run_id"]
+    client.post(f"/replay/{replay_id}/simulate")
+    report = client.get(f"/replay/{replay_id}/report").json()
+    all_scenarios = report["recommended_migrations"] + report["do_not_migrate"]
+    for s in all_scenarios:
+        assert s["source_model"] != s["target_model"], (
+            f"Self-migration scenario: {s['source_model']}"
+        )
+
+
+def test_no_self_migration_in_db_rows(client):
+    """Every persisted simulation row — including hold/investigate — must have source != target."""
+    from app.database import get_migration_simulations_for_replay_run
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    replay_id = _run_replay(
+        client, run_id, {"candidate_models": ["gpt-4o", "gpt-4o-mini", "claude-3-haiku-20240307"]}
+    ).json()["replay_run_id"]
+    client.post(f"/replay/{replay_id}/simulate")
+    rows = get_migration_simulations_for_replay_run(replay_id)
+    assert len(rows) > 0, "Expected at least one simulation row persisted"
+    for row in rows:
+        assert row["source_model"] != row["target_model"], (
+            f"Self-migration row in DB: source_model={row['source_model']}"
+        )
+
+
+# ── Task type classification in API flow ──────────────────────────────────────
+
+def test_upload_classifies_task_type_for_records(client):
+    from app.database import get_usage_records as _get_records
+    csv = (
+        b"prompt,response,timestamp,model,cost\n"
+        b'"Summarize this quarterly report","Summary here",2024-01-15 09:00:00,gpt-4o,0.03\n'
+        b'"Classify this support ticket","billing",2024-01-16 10:00:00,gpt-4o,0.002\n'
+    )
+    run_id = _upload(client, csv).json()["audit_run_id"]
+    records = _get_records(run_id)
+    task_types = {r["task_type"] for r in records}
+    assert "summarization" in task_types
+    assert "classification" in task_types
+
+
+def test_replay_scenarios_reflect_classified_task_type(client):
+    from app.database import get_usage_records as _get_records
+    csv = (
+        b"prompt,response,timestamp,model,cost\n"
+        b'"Summarize this quarterly report into bullet points","Summary here",2024-01-15 09:00:00,gpt-4o,0.05\n'
+    )
+    run_id = _upload(client, csv).json()["audit_run_id"]
+    records = _get_records(run_id)
+    assert records[0]["task_type"] == "summarization"
+
+    replay_id = _run_replay(client, run_id).json()["replay_run_id"]
+    client.post(f"/replay/{replay_id}/simulate")
+    report = client.get(f"/replay/{replay_id}/report").json()
+    all_scenarios = report["recommended_migrations"] + report["do_not_migrate"]
+    # All scenarios from this record should be tagged "summarization", not "other"
+    if all_scenarios:
+        for s in all_scenarios:
+            assert s["task_type"] == "summarization"
+
+
+# ── Full integration flow ─────────────────────────────────────────────────────
+
+def test_full_flow_upload_replay_simulate_report(client):
+    """End-to-end: upload → replay/run → simulate → report/markdown"""
+    audit_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    replay_id = _run_replay(client, audit_id).json()["replay_run_id"]
+    sim = client.post(f"/replay/{replay_id}/simulate").json()
+    assert "simulations_count" in sim
+    md = client.get(f"/replay/{replay_id}/report/markdown").text
+    assert "# Gradient Replay Analysis" in md
+
+
+def test_phase1_and_phase2_annualized_spend_match(client):
+    """Phase 1 current_annual_spend and Phase 2 current_annualized_spend must agree
+    when computed over the same records using the shared date-range helper."""
+    audit_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+
+    # Phase 1 report
+    _generate(client, audit_id)
+    p1_spend = client.get(f"/audits/{audit_id}/report").json()["current_annual_spend"]
+
+    # Phase 2: replay against the same audit, then simulate + report
+    replay_id = _run_replay(client, audit_id).json()["replay_run_id"]
+    client.post(f"/replay/{replay_id}/simulate")
+    p2_spend = client.get(f"/replay/{replay_id}/report").json()["current_annualized_spend"]
+
+    assert abs(p1_spend - p2_spend) < 0.01, (
+        f"Phase 1 annualized={p1_spend:.4f} != Phase 2 annualized={p2_spend:.4f}"
+    )
+
+
+# ── Gap 1: all-self-candidate rejection ──────────────────────────────────────
+
+def test_replay_run_all_self_candidates_returns_422(client):
+    """All candidates match source model → no results → 422."""
+    run_id = _upload(client, GPT4O_ONLY_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"candidate_models": ["gpt-4o"]})
+    assert resp.status_code == 422
+    assert "candidate" in resp.json()["detail"].lower()
+
+
+def test_replay_run_self_candidate_no_db_writes(client):
+    """A rejected replay run must not persist any rows to the database."""
+    from app.database import get_connection
+    run_id = _upload(client, GPT4O_ONLY_CSV).json()["audit_run_id"]
+    _run_replay(client, run_id, {"candidate_models": ["gpt-4o"]})
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM replay_runs WHERE audit_run_id = ?", (run_id,)
+        ).fetchall()
+    assert len(rows) == 0
+
+
+def test_replay_run_mixed_candidates_succeeds_when_one_differs(client):
+    """Even with one self-candidate, results from other candidates → 200."""
+    run_id = _upload(client, GPT4O_ONLY_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"candidate_models": ["gpt-4o", "gpt-4o-mini"]})
+    assert resp.status_code == 200
+
+
+# ── Gap 2 & 4: evaluator_mode validation ─────────────────────────────────────
+
+def test_replay_run_invalid_evaluator_mode_returns_422(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"evaluator_mode": "bad_mode"})
+    assert resp.status_code == 422
+
+
+def test_replay_run_prometheus_evaluator_mode_returns_422(client):
+    """prometheus is a Phase 3 stub; API rejects it until configured."""
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"evaluator_mode": "prometheus"})
+    assert resp.status_code == 422
+
+
+def test_replay_run_llm_judge_evaluator_mode_returns_422(client):
+    """llm_judge is a Phase 3 stub; API rejects it until configured."""
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"evaluator_mode": "llm_judge"})
+    assert resp.status_code == 422
+
+
+def test_replay_run_heuristic_evaluator_mode_accepted(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"evaluator_mode": "heuristic"})
+    assert resp.status_code == 200
+
+
+# ── Gap 3: max_records validation ────────────────────────────────────────────
+
+def test_replay_run_max_records_zero_returns_422(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"max_records": 0})
+    assert resp.status_code == 422
+
+
+def test_replay_run_max_records_negative_returns_422(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"max_records": -5})
+    assert resp.status_code == 422
+
+
+def test_replay_run_max_records_one_is_valid(client):
+    run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
+    resp = _run_replay(client, run_id, {"max_records": 1})
+    assert resp.status_code == 200
+    assert resp.json()["records_selected"] == 1

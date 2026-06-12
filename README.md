@@ -200,3 +200,110 @@ Phase 1 savings estimates are heuristic: conservative rates derived from model t
 Phase 2 replaces those estimates with evidence. It will run a sample of your historical prompts against cheaper candidate models and compare output quality. Instead of saying "summarization typically saves 45%," Gradient will *show you* whether `claude-3-5-sonnet` produces acceptable summaries for your specific workload — and quantify the quality tradeoff.
 
 This is what makes it a procurement tool, not a token dashboard.
+
+---
+
+## Phase 2: Local Replay Scaffold
+
+Phase 2 is fully functional locally — no real provider API calls required. The components below work together as a deterministic simulation layer.
+
+### Key components
+
+**`FakeProvider`** (`app/providers/fake.py`)
+Implements the `GenerationProvider` interface without any external API calls. Uses MD5 hashing of `(prompt, model)` to return deterministic responses across runs. Pricing and latency are scaled by model tier from the catalog.
+
+**`HeuristicEvaluator`** (`app/evaluation/heuristic_evaluator.py`)
+The default evaluator — no LLM calls, no external APIs. Uses task-specific heuristics for all seven task types (summarization, classification, extraction, research, coding, customer support, other). Returns a `QualityEvaluation` with four fields: `score` (0.0–1.0), `explanation` (human-readable rationale), `confidence` (how reliable the score is for this task type), and `flags` (machine-readable signals such as `empty_response`, `research_conservative`, `missing_code_structure`). Research and coding scores are conservatively capped.
+
+Select via `EVALUATOR_MODE=heuristic` (default). Use `get_evaluator(mode)` from `app/evaluation/factory.py` for programmatic selection.
+
+**Prometheus / LLM judge evaluators** (`app/evaluation/prometheus_evaluator.py`, `app/evaluation/llm_judge_evaluator.py`)
+Clean stubs — raise `NotImplementedError` until real credentials and endpoints are wired. Each file documents the expected input format and output parsing contract for Phase 3 integration. **The API rejects `evaluator_mode=prometheus` and `evaluator_mode=llm_judge` with 422 until Phase 3 is wired.** The factory (`app/evaluation/factory.py`) still supports them for direct programmatic use.
+
+**`ReplayRunner`** (`app/replay/replay_runner.py`)
+Accepts any `GenerationProvider` and `BaseEvaluator`. Runs every `ReplayRequest` against every enabled `ReplayCandidate`. Errors are captured per result and never abort the full run.
+
+Self-model candidates are always skipped: a candidate whose model name matches the source record's model produces no result for that record. If **all** selected candidates match the source model(s), the endpoint returns 422 and nothing is persisted.
+
+Two construction helpers:
+- `build_replay_requests(records)` — builds from in-memory `UsageRecord` objects; assigns synthetic UUIDs (no DB traceability)
+- `build_replay_requests_from_rows(rows)` — builds from SQLite `usage_records` row dicts; uses the DB `id` as `original_record_id` for full traceability
+
+Both builders carry the original `feedback` signal (positive/negative/etc.) into `ReplayRequest.feedback`. The runner passes it to the evaluator, where it is available as context for future quality scoring improvements.
+
+**`MigrationSimulator`** (`app/replay/migration_simulator.py`)
+Two modes:
+- `simulate_migration(records, scenario)` — Phase 1 heuristic using catalog pricing ratios.
+- `simulate_from_replay_data(original_records, replay_results)` — **Phase 2 evidence-based**, using actual replay quality scores and costs. Groups results by `(source_model, target_model, task_type)` and applies conservative migration rules:
+  - quality loss < 2% and savings > 20% → `migrate`
+  - quality loss 2–5% and savings > 30% → `controlled_pilot`
+  - quality loss > 5% → `no_migration`
+  - research/coding: tighter thresholds; classification/summarization: looser
+  - Confidence scored from: record count, evaluator confidence, failure rate, quality score variance, task risk level
+
+**`ExecutiveReplayReport`** (`app/replay/replay_report.py`)
+The canonical Phase 2 output. Gradient's answer to: *"If we migrated this workload, what would actually happen?"* Combines all migration simulations into a structured report with `recommended_migrations`, `do_not_migrate`, `risk_notes`, and `next_actions`. Available as JSON or Markdown via the API. **This is the primary report endpoint for Phase 2** — not the per-model `ReplayReport` / `ModelReplaySummary` objects, which are internal to the simulation layer.
+
+### API endpoints (Phase 2)
+
+| Endpoint | Description |
+|---|---|
+| `POST /audits/{audit_run_id}/replay/run` | Run replay against candidate models |
+| `POST /replay/{replay_run_id}/simulate` | Run evidence-based migration simulation |
+| `GET /replay/{replay_run_id}/report` | Executive replay report — JSON. **Requires `/simulate` first.** |
+| `GET /replay/{replay_run_id}/report/markdown` | Executive replay report — Markdown. **Requires `/simulate` first.** |
+
+Calling `/report` or `/report/markdown` before `/simulate` returns 422.
+
+**Request body for `replay/run`:**
+```json
+{
+  "candidate_models": ["gpt-4o-mini", "claude-3-haiku-20240307"],
+  "task_types": ["summarization", "classification"],
+  "max_records": 100,
+  "evaluator_mode": "heuristic"
+}
+```
+All fields are optional. Omitting `candidate_models` runs all enabled candidates. Omitting `task_types` runs all records. `max_records` must be ≥ 1 if provided. `evaluator_mode` must be `"heuristic"` in Phase 2; other values return 422.
+
+**Required call sequence:**
+```
+POST /audits/{id}/replay/run   →  replay_run_id
+POST /replay/{id}/simulate     →  simulations_count
+GET  /replay/{id}/report       →  ExecutiveReplayReport (JSON)
+GET  /replay/{id}/report/markdown  →  Markdown memo
+```
+
+`/simulate` is idempotent: calling it again replaces prior simulation rows atomically (delete + insert in a single transaction). `/report` always reflects the most recent `/simulate` output.
+
+### Run a local replay
+
+```python
+from datetime import datetime
+from app.database import get_usage_records
+from app.providers.fake import FakeProvider
+from app.evaluation.heuristic_evaluator import HeuristicEvaluator
+from app.replay.replay_runner import ReplayRunner, build_replay_requests_from_rows
+from app.replay.replay_models import REPLAY_CANDIDATES
+from app.replay.migration_simulator import simulate_from_replay_data
+from app.utils.date_range import calculate_date_range_days
+
+# usage_rows comes from get_usage_records(audit_run_id) — dicts with DB-style "id" fields
+usage_rows = get_usage_records(audit_run_id)
+
+runner = ReplayRunner(provider=FakeProvider(), evaluator=HeuristicEvaluator())
+requests = build_replay_requests_from_rows(usage_rows)
+results = runner.run(requests, REPLAY_CANDIDATES)
+
+timestamps = [datetime.fromisoformat(r["timestamp"]) for r in usage_rows if r.get("timestamp")]
+date_range_days = calculate_date_range_days(timestamps)
+
+simulations = simulate_from_replay_data(usage_rows, [r.model_dump() for r in results], date_range_days)
+
+for s in simulations:
+    print(f"{s.scenario_name}: savings=${s.estimated_annual_savings:.0f}/yr  confidence={s.confidence_score:.0%}  → {s.recommendation}")
+```
+
+`usage_rows` must be the dicts returned by `get_usage_records()` (they carry the DB `id` field). Passing `UsageRecord.model_dump()` output directly will silently produce no simulation results because the dicts have no `id` and the simulator cannot link replay results back to source records.
+
+Swap `FakeProvider` for a real provider implementation when you have API credentials. The rest of the pipeline is unchanged.

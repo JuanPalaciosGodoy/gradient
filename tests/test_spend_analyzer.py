@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.audit.spend_analyzer import analyze_spend
+from app.utils.date_range import calculate_date_range_days
 from app.schemas import TaskType, UsageRecord
 
 
@@ -48,19 +49,19 @@ def test_model_breakdown():
 
 
 def test_annualization():
-    # 30 records spanning 29 days
+    # 30 records spanning 30 inclusive days (days_ago 0 through 29)
     records = [make_record(1.0, days_ago=i) for i in range(30)]
     summary = analyze_spend(records)
-    assert summary.date_range_days == 29
-    expected_annualized = 30.0 * (365 / 29)
+    assert summary.date_range_days == 30
+    expected_annualized = 30.0 * (365 / 30)
     assert abs(summary.annualized_cost - expected_annualized) < 1.0
 
 
 def test_daily_avg_spend():
-    records = [make_record(1.0, days_ago=i) for i in range(10)]  # 9-day spread, $10 total
+    records = [make_record(1.0, days_ago=i) for i in range(10)]  # 10 inclusive days, $10 total
     summary = analyze_spend(records)
-    assert summary.date_range_days == 9
-    assert abs(summary.daily_avg_spend - 10.0 / 9) < 0.001
+    assert summary.date_range_days == 10
+    assert abs(summary.daily_avg_spend - 10.0 / 10) < 0.001
 
 
 def test_empty_records_daily_avg_is_zero():
@@ -151,3 +152,30 @@ def test_top_cost_driving_task_types_sorted_descending():
 def test_top_cost_driving_task_types_empty_for_no_records():
     summary = analyze_spend([])
     assert summary.top_cost_driving_task_types == []
+
+
+# ── calculate_date_range_days (canonical location) ────────────────────────────
+
+def test_date_range_days_single_record_is_one():
+    ts = datetime(2024, 1, 15, tzinfo=timezone.utc)
+    assert calculate_date_range_days([ts]) == 1
+
+
+def test_date_range_days_same_day_is_one():
+    ts1 = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 15, 17, 0, tzinfo=timezone.utc)
+    assert calculate_date_range_days([ts1, ts2]) == 1
+
+
+def test_date_range_days_adjacent_is_two():
+    ts1 = datetime(2024, 1, 15, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 16, tzinfo=timezone.utc)
+    assert calculate_date_range_days([ts1, ts2]) == 2
+
+
+def test_date_range_days_spend_analyzer_uses_inclusive_semantics():
+    """analyze_spend and calculate_date_range_days must agree."""
+    records = [make_record(1.0, days_ago=i) for i in range(5)]  # days_ago 0..4 → 5 inclusive days
+    summary = analyze_spend(records)
+    timestamps = [r.timestamp for r in records]
+    assert summary.date_range_days == calculate_date_range_days(timestamps) == 5

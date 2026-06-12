@@ -3,6 +3,7 @@ import uuid
 import streamlit as st
 
 from app.audit.report_builder import build_report
+from app.audit.task_classifier import classify_task
 from app.database import init_db, save_audit_run, save_report, save_usage_records
 from app.ingestion.csv_loader import load_csv
 from app.reports.markdown import render_markdown_report
@@ -29,7 +30,13 @@ if uploaded_file:
         with st.spinner("Analyzing usage data…"):
             run_id = str(uuid.uuid4())
             save_audit_run(run_id=run_id, file_name=uploaded_file.name, record_count=len(records))
-            save_usage_records(run_id, [r.model_dump(mode="json") for r in records])
+            records_dicts = []
+            for r in records:
+                d = r.model_dump(mode="json")
+                if d.get("task_type") is None:
+                    d["task_type"] = classify_task(r.prompt).value
+                records_dicts.append(d)
+            save_usage_records(run_id, records_dicts)
             report = build_report(run_id, records)
             save_report(report)
 

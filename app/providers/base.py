@@ -1,6 +1,9 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
+
+# ── Usage ingestion (Phase 1) ────────────────────────────────────────────────
 
 @dataclass
 class UsageStats:
@@ -10,6 +13,8 @@ class UsageStats:
 
 
 class BaseProvider(ABC):
+    """Fetches historical usage data from a provider's API."""
+
     @abstractmethod
     def name(self) -> str: ...
 
@@ -18,3 +23,22 @@ class BaseProvider(ABC):
 
     @abstractmethod
     def validate_credentials(self) -> bool: ...
+
+
+# ── Completion generation (Phase 2 / Replay Engine) ──────────────────────────
+
+@dataclass
+class ProviderResponse:
+    text: str
+    latency_ms: float
+    input_tokens: int
+    output_tokens: int
+    estimated_cost: float
+    raw_response: Optional[dict] = field(default=None)
+
+
+class GenerationProvider(ABC):
+    """Runs a single prompt against a model and returns a structured response."""
+
+    @abstractmethod
+    def generate(self, prompt: str, model: str) -> ProviderResponse: ...

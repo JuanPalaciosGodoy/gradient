@@ -1,7 +1,7 @@
 import pandas as pd
 from pydantic import ValidationError
 
-from app.schemas import UsageRecord
+from app.schemas import TaskType, UsageRecord
 
 
 def validate_columns(present: set[str], required: set[str]) -> None:
@@ -33,6 +33,15 @@ def validate_row(row: pd.Series, idx: int) -> UsageRecord:
         if raw is not None and not (isinstance(raw, float) and pd.isna(raw)):
             feedback = str(raw)
 
+    task_type = None
+    if "task_type" in row.index:
+        raw_tt = row["task_type"]
+        if raw_tt is not None and not (isinstance(raw_tt, float) and pd.isna(raw_tt)):
+            try:
+                task_type = TaskType(str(raw_tt).lower().strip())
+            except ValueError:
+                pass  # unknown value; classifier will fill in during upload
+
     try:
         return UsageRecord(
             prompt=str(row["prompt"]),
@@ -41,6 +50,7 @@ def validate_row(row: pd.Series, idx: int) -> UsageRecord:
             model=str(row["model"]).strip(),
             cost=cost,
             feedback=feedback,
+            task_type=task_type,
         )
     except ValidationError as e:
         raise ValueError(str(e)) from e

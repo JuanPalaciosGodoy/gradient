@@ -2,6 +2,7 @@ from collections import defaultdict
 
 from app.audit.model_catalog import get_provider
 from app.schemas import SpendSummary, TaskCostItem, UsageRecord
+from app.utils.date_range import calculate_date_range_days
 
 
 def analyze_spend(records: list[UsageRecord]) -> SpendSummary:
@@ -19,9 +20,7 @@ def analyze_spend(records: list[UsageRecord]) -> SpendSummary:
         )
 
     timestamps = [r.timestamp for r in records]
-    min_date = min(timestamps)
-    max_date = max(timestamps)
-    date_range_days = max((max_date - min_date).days, 1)
+    date_range_days = calculate_date_range_days(timestamps)
 
     total_cost = sum(r.cost for r in records)
     annualized_cost = total_cost * (365 / date_range_days)

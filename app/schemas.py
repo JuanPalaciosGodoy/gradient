@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class TaskType(str, Enum):
@@ -127,3 +127,32 @@ class GenerateResponse(BaseModel):
     audit_run_id: str
     report_id: str
     status: str
+
+
+# ── Replay API schemas ────────────────────────────────────────────────────────
+
+class ReplayRunRequest(BaseModel):
+    candidate_models: Optional[list[str]] = None  # None = all enabled candidates
+    task_types: Optional[list[str]] = None         # None = all task types
+    max_records: Optional[int] = Field(default=None, ge=1)
+    evaluator_mode: Literal["heuristic"] = "heuristic"
+
+
+class ReplayRunResponse(BaseModel):
+    replay_run_id: str
+    status: str
+    records_selected: int
+    candidates_selected: list[str]
+
+
+class SimulationTopRecommendation(BaseModel):
+    scenario_name: str
+    recommendation: str
+    estimated_annual_savings: float
+    confidence_pct: int
+
+
+class SimulationResponse(BaseModel):
+    replay_run_id: str
+    simulations_count: int
+    top_scenarios: list[SimulationTopRecommendation]
