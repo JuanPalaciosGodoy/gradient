@@ -2,7 +2,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from app.audit.model_catalog import get_quality_tier
-from app.schemas import Opportunity, TaskType, UsageRecord
+from app.schemas import EvidenceLevel, Opportunity, TaskType, UsageRecord, ValidationStatus
+from app.utils.evidence import adjust_confidence_for_evidence
 
 # Lower index = more expensive tier
 TIER_ORDER: dict[str, int] = {
@@ -130,6 +131,20 @@ def find_opportunities(records: list[UsageRecord], date_range_days: int) -> list
                 rationale=rule.rationale,
                 recommended_action=(
                     f"Move {task_label} workloads from {model} to a {target_tier} model such as {alt}."
+                ),
+                evidence_level=EvidenceLevel.HEURISTIC,
+                evidence_summary=(
+                    f"Heuristic estimate based on model tier analysis. {len(group)} historical "
+                    f"{task_label} request(s) on {model}. No replay data available."
+                ),
+                limitations=[
+                    "Savings rate is a conservative heuristic estimate, not measured from real outputs.",
+                    "Quality impact estimated from tier difference; individual results may vary.",
+                    "Validate with replay analysis before making production changes.",
+                ],
+                validation_status=ValidationStatus.NOT_VALIDATED,
+                confidence_score=adjust_confidence_for_evidence(
+                    rule.confidence, EvidenceLevel.HEURISTIC, ValidationStatus.NOT_VALIDATED
                 ),
             )
         )

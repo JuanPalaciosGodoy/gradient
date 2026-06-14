@@ -39,8 +39,17 @@ def render_markdown_report(report: AuditReport) -> str:
             "",
         ]
     else:
+        lines += [
+            "### Heuristic Opportunities",
+            "",
+            "_All findings below are **heuristic estimates** based on spend analysis "
+            "and model tier pricing ratios. Use the Replay Engine to validate these findings "
+            "with actual output quality measurements before making production changes._",
+            "",
+        ]
         for i, opp in enumerate(report.top_opportunities, 1):
             task_label = opp.task_type.replace("_", " ").title()
+            evidence_label = opp.evidence_level.value.replace("_", " ").title()
             lines += [
                 f"### {i}. {task_label}",
                 "",
@@ -50,6 +59,8 @@ def render_markdown_report(report: AuditReport) -> str:
                 f"| **Recommended model** | {opp.recommended_model} ({opp.recommended_model_group}) |",
                 f"| **Estimated annual savings** | ${opp.estimated_annual_savings:,.0f} ({opp.estimated_savings_pct:.0f}% reduction) |",
                 f"| **Confidence** | {opp.confidence:.0%} |",
+                f"| **Evidence level** | {evidence_label} |",
+                f"| **Validation status** | {opp.validation_status.value.replace('_', ' ').title()} |",
                 "",
                 f"**Recommendation:** {opp.recommended_action}",
                 "",

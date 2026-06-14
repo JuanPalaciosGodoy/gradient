@@ -67,3 +67,35 @@ def test_empty_model_raises():
     csv = b"prompt,response,timestamp,model,cost\nhello,world,2024-01-15 09:00:00,  ,0.01\n"
     with pytest.raises(ValueError):
         load_csv(csv)
+
+
+# ── Metadata-only sentinel ────────────────────────────────────────────────────
+
+def test_empty_prompt_becomes_sentinel():
+    """Blank prompt must not become the literal string 'nan'."""
+    from app.ingestion.validators import METADATA_ONLY_SENTINEL
+    csv = b"prompt,response,timestamp,model,cost\n,some response,2024-01-15 09:00:00,gpt-4o,0.01\n"
+    records = load_csv(csv)
+    assert records[0].prompt == METADATA_ONLY_SENTINEL
+
+
+def test_empty_response_becomes_sentinel():
+    from app.ingestion.validators import METADATA_ONLY_SENTINEL
+    csv = b"prompt,response,timestamp,model,cost\nsome prompt,,2024-01-15 09:00:00,gpt-4o,0.01\n"
+    records = load_csv(csv)
+    assert records[0].response == METADATA_ONLY_SENTINEL
+
+
+def test_both_empty_prompt_and_response_become_sentinel():
+    from app.ingestion.validators import METADATA_ONLY_SENTINEL
+    csv = b"prompt,response,timestamp,model,cost\n,,2024-01-15 09:00:00,gpt-4o,0.01\n"
+    records = load_csv(csv)
+    assert records[0].prompt == METADATA_ONLY_SENTINEL
+    assert records[0].response == METADATA_ONLY_SENTINEL
+
+
+def test_task_type_column_preserved_when_present():
+    csv = b"prompt,response,timestamp,model,cost,task_type\n,, 2024-01-15 09:00:00,gpt-4o,0.01,summarization\n"
+    records = load_csv(csv)
+    from app.schemas import TaskType
+    assert records[0].task_type == TaskType.SUMMARIZATION

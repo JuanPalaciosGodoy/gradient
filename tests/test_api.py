@@ -667,11 +667,11 @@ def test_replay_run_prometheus_evaluator_mode_returns_422(client):
     assert resp.status_code == 422
 
 
-def test_replay_run_llm_judge_evaluator_mode_returns_422(client):
-    """llm_judge is a Phase 3 stub; API rejects it until configured."""
+def test_replay_run_llm_judge_evaluator_mode_succeeds(client):
+    """llm_judge uses FakeProvider in default mode and falls back to heuristic."""
     run_id = _upload(client, VALID_CSV).json()["audit_run_id"]
     resp = _run_replay(client, run_id, {"evaluator_mode": "llm_judge"})
-    assert resp.status_code == 422
+    assert resp.status_code == 200
 
 
 def test_replay_run_heuristic_evaluator_mode_accepted(client):

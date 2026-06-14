@@ -77,7 +77,9 @@ def _build_executive_summary(
         f"and identifies approximately {savings_str} in potential annual savings. "
         f"The largest opportunities are {task_phrase} workloads currently running on "
         f"higher-tier models. "
-        "We recommend validating these migrations through a replay analysis before making production changes."
+        "These findings are heuristic estimates based on spend data and model tier analysis — "
+        "not measured from actual output quality. "
+        "Use the Replay Engine to validate savings and quality impact before making production changes."
     )
 
 

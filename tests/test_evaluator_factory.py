@@ -43,10 +43,15 @@ def test_prometheus_raises_not_implemented_on_evaluate():
         ev.evaluate("prompt", "original", "candidate", task_type="summarization")
 
 
-def test_llm_judge_raises_not_implemented_on_evaluate():
+def test_llm_judge_evaluates_with_fallback(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "real_provider_mode", False)
     ev = get_evaluator("llm_judge")
-    with pytest.raises(NotImplementedError):
-        ev.evaluate("prompt", "original", "candidate", task_type="summarization")
+    result = ev.evaluate("prompt", "original", "candidate", task_type="summarization")
+    # FakeProvider returns non-JSON text → parse fails → fallback method used
+    assert result.method == "llm_judge_fallback"
+    assert "llm_judge_fallback" in result.flags
+    assert 0.0 <= result.score <= 1.0
 
 
 # ── Config-driven selection ───────────────────────────────────────────────────

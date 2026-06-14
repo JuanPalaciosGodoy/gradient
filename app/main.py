@@ -3,23 +3,30 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.audit.report_builder import build_report
 from app.database import (
     audit_run_exists,
+    get_human_reviews_for_run,
+    get_latest_human_review_time,
+    get_latest_simulation_created_at,
     get_replay_run,
     get_report,
     get_usage_records,
     init_db,
     save_audit_run,
+    save_human_review,
     save_report,
     save_usage_records,
+    update_replay_result_evidence,
 )
 from app.audit.task_classifier import classify_task
+from app.ingestion.validators import METADATA_ONLY_SENTINEL
 from app.evaluation.factory import get_evaluator
 from app.ingestion.csv_loader import load_csv
-from app.providers.fake import FakeProvider
+from app.providers.router import get_generation_provider
+from app.replay.human_review import apply_human_reviews, export_replay_results_csv, parse_import_csv
 from app.replay.migration_simulator import simulate_from_replay_data
 from app.utils.date_range import calculate_date_range_days
 from app.replay.replay_models import REPLAY_CANDIDATES
@@ -48,6 +55,13 @@ from app.schemas import (
     UploadResponse,
     UsageRecord,
     ValidationSummary,
+)
+from app.sdk_ingestion import (
+    FeedbackRequest,
+    SDKEventsRequest,
+    SDKEventsResponse,
+    save_sdk_event,
+    update_sdk_event_feedback,
 )
 
 
@@ -101,12 +115,16 @@ async def upload_audit(file: UploadFile = File(...)):
     audit_run_id = str(uuid.uuid4())
     save_audit_run(run_id=audit_run_id, file_name=file.filename, record_count=len(records))
 
-    # Classify task_type for any record where it wasn't explicitly provided in the CSV
+    # Classify task_type for any record where it wasn't explicitly provided in the CSV.
+    # Metadata-only records (sentinel prompt) are tagged as OTHER rather than classified.
     records_dicts = []
     for r in records:
         d = r.model_dump(mode="json")
         if d.get("task_type") is None:
-            d["task_type"] = classify_task(r.prompt).value
+            if r.prompt == METADATA_ONLY_SENTINEL:
+                d["task_type"] = TaskType.OTHER.value
+            else:
+                d["task_type"] = classify_task(r.prompt).value
         records_dicts.append(d)
     save_usage_records(audit_run_id=audit_run_id, records=records_dicts)
 
@@ -188,6 +206,23 @@ def run_replay(audit_run_id: str, body: ReplayRunRequest = ReplayRunRequest()):
             detail="No records match the specified criteria.",
         )
 
+    # Filter out metadata-only records (prompt/response not captured).
+    replayable = [
+        r for r in raw
+        if r.get("prompt") != METADATA_ONLY_SENTINEL
+        and r.get("response") != METADATA_ONLY_SENTINEL
+    ]
+    if not replayable:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Replay requires captured prompt and response content. "
+                "Re-run the SDK with capture_prompt=True and capture_response=True "
+                "for this workflow, then upload a new audit."
+            ),
+        )
+    raw = replayable
+
     replay_requests = build_replay_requests_from_rows(raw)
 
     # Resolve candidates
@@ -200,7 +235,7 @@ def run_replay(audit_run_id: str, body: ReplayRunRequest = ReplayRunRequest()):
         raise HTTPException(status_code=422, detail="No valid candidate models found.")
 
     evaluator = get_evaluator(body.evaluator_mode)
-    runner = ReplayRunner(provider=FakeProvider(), evaluator=evaluator)
+    runner = ReplayRunner(provider_factory=get_generation_provider, evaluator=evaluator)
     results = runner.run(replay_requests, candidates)
 
     if not results:
@@ -263,6 +298,10 @@ def simulate_replay(replay_run_id: str):
                 recommendation=s.recommendation,
                 estimated_annual_savings=s.estimated_annual_savings,
                 confidence_pct=round(s.confidence_score * 100),
+                evidence_level=s.evidence_level,
+                evidence_summary=s.evidence_summary,
+                validation_status=s.validation_status,
+                confidence_score=s.confidence_score,
             )
             for s in top
         ],
@@ -280,6 +319,21 @@ def _load_replay_report(replay_run_id: str):
         raise HTTPException(
             status_code=422,
             detail="No simulations found. Run POST /replay/{replay_run_id}/simulate first.",
+        )
+
+    # Detect stale simulations: if human reviews were imported after the last simulation
+    # was computed, the report would show pre-review evidence levels. Return 409 so the
+    # caller knows to re-run /simulate before fetching the report.
+    latest_sim_time = get_latest_simulation_created_at(replay_run_id)
+    latest_review_time = get_latest_human_review_time(replay_run_id)
+    if latest_sim_time and latest_review_time and latest_review_time > latest_sim_time:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Human reviews were imported after the last simulation run. "
+                f"Re-run POST /replay/{replay_run_id}/simulate to incorporate "
+                "human review evidence into migration simulations."
+            ),
         )
 
     audit_run_id = replay_run.get("audit_run_id")
@@ -317,3 +371,127 @@ def fetch_replay_report(replay_run_id: str):
 def fetch_replay_report_markdown(replay_run_id: str):
     report = _load_replay_report(replay_run_id)
     return render_replay_markdown_report(report)
+
+
+# ── Human review endpoints ────────────────────────────────────────────────────
+
+@app.get("/replay/{replay_run_id}/review/export")
+def export_review_csv(replay_run_id: str):
+    replay_run = get_replay_run(replay_run_id)
+    if replay_run is None:
+        raise HTTPException(status_code=404, detail="Replay run not found.")
+
+    audit_run_id = replay_run.get("audit_run_id")
+    usage_records = get_usage_records(audit_run_id) if audit_run_id else []
+    replay_results = get_replay_results(replay_run_id)
+
+    if not replay_results:
+        raise HTTPException(status_code=422, detail="No replay results to export.")
+
+    csv_content = export_replay_results_csv(replay_run_id, replay_results, usage_records)
+    filename = f"review_{replay_run_id[:8]}.csv"
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/replay/{replay_run_id}/review/import")
+async def import_review_csv(replay_run_id: str, file: UploadFile = File(...)):
+    replay_run = get_replay_run(replay_run_id)
+    if replay_run is None:
+        raise HTTPException(status_code=404, detail="Replay run not found.")
+
+    content = await file.read()
+    try:
+        csv_text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=422, detail="File must be UTF-8 encoded.")
+
+    try:
+        rows = parse_import_csv(csv_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if not rows:
+        raise HTTPException(status_code=422, detail="No valid review rows found in CSV.")
+
+    replay_results = get_replay_results(replay_run_id)
+    valid_replay_ids = {rr["replay_id"] for rr in replay_results}
+    unknown_ids = [r["replay_id"] for r in rows if r["replay_id"] not in valid_replay_ids]
+    if unknown_ids:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"These replay_result_ids do not belong to replay run {replay_run_id}: "
+                + ", ".join(unknown_ids)
+            ),
+        )
+
+    updates = apply_human_reviews(rows, replay_results)
+
+    for upd in updates:
+        save_human_review(
+            replay_run_id=replay_run_id,
+            replay_id=upd["replay_id"],
+            reviewer_label=upd["reviewer_label"],
+            reviewer_notes=upd["reviewer_notes"],
+            reviewed_at=upd["reviewed_at"],
+        )
+        update_replay_result_evidence(
+            replay_id=upd["replay_id"],
+            replay_run_id=replay_run_id,
+            evidence_level=upd["evidence_level"],
+            validation_status=upd["validation_status"],
+            confidence_score=upd["confidence_score"],
+        )
+
+    return {
+        "status": "complete",
+        "reviews_applied": len(updates),
+        "replay_run_id": replay_run_id,
+    }
+
+
+# ── SDK ingestion ─────────────────────────────────────────────────────────────
+
+@app.post("/sdk/events", response_model=SDKEventsResponse, tags=["SDK"])
+def ingest_sdk_events(body: SDKEventsRequest) -> SDKEventsResponse:
+    """Accept a batch of AuditEvents from the Gradient SDK.
+
+    Duplicate event_ids are counted separately and not double-counted as accepted.
+    Returns accepted/duplicate/rejected counts and per-event error messages.
+    """
+    accepted = 0
+    duplicate = 0
+    rejected = 0
+    errors: list[str] = []
+    for event in body.events:
+        try:
+            inserted = save_sdk_event(event)
+            if inserted:
+                accepted += 1
+            else:
+                duplicate += 1
+        except Exception as exc:
+            rejected += 1
+            errors.append(f"{event.event_id}: {exc}")
+    return SDKEventsResponse(accepted=accepted, duplicate=duplicate, rejected=rejected, errors=errors)
+
+
+@app.patch("/sdk/events/{event_id}/feedback", tags=["SDK"])
+def update_event_feedback(event_id: str, body: FeedbackRequest):
+    """Attach or update feedback on a previously ingested SDK event.
+
+    Returns 404 if the event_id is unknown.
+    """
+    updated = update_sdk_event_feedback(
+        event_id=event_id,
+        feedback_score=body.feedback_score,
+        feedback_label=body.feedback_label,
+        notes=body.notes,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"SDK event not found: {event_id}")
+    return {"event_id": event_id, "updated": True}
