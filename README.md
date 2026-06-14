@@ -175,9 +175,10 @@ Confidence:             73%
 - **No authentication.** Every upload is open. Don't expose this publicly yet.
 - **Reports are persisted as JSON in SQLite.** Calling `POST /generate` regenerates and replaces the stored report for that audit run. Report history and versioning are not implemented.
 - **Task classification is keyword-based.** It covers the common cases well but won't be perfect on unusual prompts.
-- **Savings estimates are conservative and model-tier-based**, not derived from actual API pricing. They're a procurement signal, not a billing forecast.
-- **No provider API connections yet.** CSV upload only. OpenAI, Anthropic, and Gemini connectors are stubbed.
-- **SQLite only.** Fine for Phase 1. Not for multi-tenant production.
+- **Phase 1 savings estimates are conservative and model-tier-based**, not derived from actual API pricing. They're a procurement signal, not a billing forecast. Phase 2.5 replay simulation uses real pricing via provider APIs.
+- **Real provider APIs are supported but beta.** OpenAI, Anthropic, and Gemini connectors are wired. Replay calls cost real money and require valid API credentials. The default evaluator mode (`heuristic`) requires no external calls.
+- **Metadata-only audits support spend and task analysis but not replay.** Records uploaded without captured prompt and response cannot be replayed. Use `capture_prompt=True` and `capture_response=True` on the `@audit` decorator to enable replay for a workflow.
+- **SQLite only.** Fine for development and pilots. Not for multi-tenant production.
 
 ---
 
@@ -193,17 +194,23 @@ It uses the audit engine directly (no separate API server needed). Upload a CSV,
 
 ---
 
-## Phase 2: Replay Engine
+## Phase 2.5: Replay Engine + SDK + Evidence Model
 
 Phase 1 savings estimates are heuristic: conservative rates derived from model tiers, not actual output quality data.
 
-Phase 2 replaces those estimates with evidence. It will run a sample of your historical prompts against cheaper candidate models and compare output quality. Instead of saying "summarization typically saves 45%," Gradient will *show you* whether `claude-3-5-sonnet` produces acceptable summaries for your specific workload — and quantify the quality tradeoff.
+Phase 2.5 replaces those estimates with evidence. It runs a sample of your historical prompts against cheaper candidate models, compares output quality, and builds a structured evidence tier per migration scenario — so recommendations are backed by data, not assumptions.
 
-This is what makes it a procurement tool, not a token dashboard.
+**What's in Phase 2.5:**
+- **Real provider replay** — OpenAI, Anthropic, and Gemini connectors send prompts to live APIs and return actual model responses. Requires credentials; incurs real cost.
+- **Evidence levels** — each migration scenario is rated: `heuristic → estimated → observed_replay → llm_judge → human_reviewed → production_validated`. Evidence level gates how strongly a migration is recommended.
+- **Coverage-aware promotion** — a scenario only claims `human_reviewed` evidence if ≥80% of its replay results were human-reviewed. Partial coverage gets a small confidence boost but does not promote the label.
+- **SDK instrumentation** — the `@audit` decorator captures AI workflow metadata (and optionally prompt/response) without breaking production. Metadata-only mode requires no prompt capture.
+- **Human review loop** — export a CSV of replay results, fill in `reviewer_label`, and re-import. Re-simulate to incorporate human evidence into migration recommendations.
+- **Local JSONL → Phase 1 CSV export** — metadata-only events can be exported for Phase 1 spend analysis without any prompt/response content leaving the process.
 
 ---
 
-## Phase 2: Local Replay Scaffold
+## Phase 2.5: Replay Scaffold
 
 Phase 2 is fully functional locally — no real provider API calls required. The components below work together as a deterministic simulation layer.
 
@@ -217,8 +224,11 @@ The default evaluator — no LLM calls, no external APIs. Uses task-specific heu
 
 Select via `EVALUATOR_MODE=heuristic` (default). Use `get_evaluator(mode)` from `app/evaluation/factory.py` for programmatic selection.
 
-**Prometheus / LLM judge evaluators** (`app/evaluation/prometheus_evaluator.py`, `app/evaluation/llm_judge_evaluator.py`)
-Clean stubs — raise `NotImplementedError` until real credentials and endpoints are wired. Each file documents the expected input format and output parsing contract for Phase 3 integration. **The API rejects `evaluator_mode=prometheus` and `evaluator_mode=llm_judge` with 422 until Phase 3 is wired.** The factory (`app/evaluation/factory.py`) still supports them for direct programmatic use.
+**LLM judge evaluator** (`app/evaluation/llm_judge_evaluator.py`)
+Uses a secondary LLM call to score candidate responses. Requires valid API credentials for the judge model. Select via `evaluator_mode=llm_judge`. When the judge call fails (network error, missing credentials), the evaluator falls back to heuristic scoring — **fallback results are recorded as `observed_replay` evidence, not `llm_judge`**, so the evidence level in the report accurately reflects what actually scored each result.
+
+**Prometheus evaluator** (`app/evaluation/prometheus_evaluator.py`)
+Placeholder — raises `NotImplementedError`. Reserved for a future Prometheus-compatible endpoint. The API rejects `evaluator_mode=prometheus` with 422.
 
 **`ReplayRunner`** (`app/replay/replay_runner.py`)
 Accepts any `GenerationProvider` and `BaseEvaluator`. Runs every `ReplayRequest` against every enabled `ReplayCandidate`. Errors are captured per result and never abort the full run.
@@ -264,15 +274,24 @@ Calling `/report` or `/report/markdown` before `/simulate` returns 422.
   "evaluator_mode": "heuristic"
 }
 ```
-All fields are optional. Omitting `candidate_models` runs all enabled candidates. Omitting `task_types` runs all records. `max_records` must be ≥ 1 if provided. `evaluator_mode` must be `"heuristic"` in Phase 2; other values return 422.
+All fields are optional. Omitting `candidate_models` runs all enabled candidates. Omitting `task_types` runs all records. `max_records` must be ≥ 1 if provided. `evaluator_mode` accepts `"heuristic"`, `"exact_match"`, `"task_router"`, and `"llm_judge"`. `"prometheus"` returns 422.
 
-**Required call sequence:**
+**Required call sequence (with optional human review loop):**
 ```
-POST /audits/{id}/replay/run   →  replay_run_id
-POST /replay/{id}/simulate     →  simulations_count
-GET  /replay/{id}/report       →  ExecutiveReplayReport (JSON)
-GET  /replay/{id}/report/markdown  →  Markdown memo
+POST /audits/{id}/replay/run        →  replay_run_id
+POST /replay/{id}/simulate          →  simulations_count, top_scenarios
+GET  /replay/{id}/report            →  ExecutiveReplayReport (JSON)
+GET  /replay/{id}/report/markdown   →  Markdown memo
+
+# Optional: upgrade evidence via human review
+GET  /replay/{id}/review/export     →  review CSV (download)
+     [reviewer fills in reviewer_label column]
+POST /replay/{id}/review/import     →  reviews_applied count
+POST /replay/{id}/simulate          →  re-simulate with human-reviewed evidence
+GET  /replay/{id}/report            →  updated report (human_reviewed evidence level)
 ```
+
+Calling `/report` after importing reviews but before re-running `/simulate` returns 409 — the report would be stale. Re-run `/simulate` to incorporate the new evidence.
 
 `/simulate` is idempotent: calling it again replaces prior simulation rows atomically (delete + insert in a single transaction). `/report` always reflects the most recent `/simulate` output.
 
@@ -307,3 +326,125 @@ for s in simulations:
 `usage_rows` must be the dicts returned by `get_usage_records()` (they carry the DB `id` field). Passing `UsageRecord.model_dump()` output directly will silently produce no simulation results because the dicts have no `id` and the simulator cannot link replay results back to source records.
 
 Swap `FakeProvider` for a real provider implementation when you have API credentials. The rest of the pipeline is unchanged.
+
+---
+
+## Start with metadata-only audit in 10 minutes
+
+Most teams don't want to send raw prompts and responses to a third-party tool on day one. The Gradient SDK gives you a low-friction path: start with metadata only, then add content capture when you're ready.
+
+### Install
+
+The SDK is in the `gradient_sdk/` package. No extra dependencies — only `pydantic`, which is already required by the backend.
+
+### Step 1 — Instrument one workflow
+
+```python
+from gradient_sdk import GradientClient, audit
+
+client = GradientClient(mode="local", local_path="audit.jsonl")
+
+@audit(
+    client=client,
+    workflow="support_ticket_reply",
+    task_type="customer_support",
+    team="support",
+    risk_level="medium",
+    # Defaults: capture_prompt=False, capture_response=False
+)
+def generate_reply(ticket: str) -> dict:
+    # your existing LLM call here
+    return {"text": "...", "model": "gpt-4o", "provider": "openai",
+            "input_tokens": 120, "output_tokens": 45, "estimated_cost": 0.00127}
+```
+
+No prompts or responses leave the process. The decorator captures:
+- workflow name, team, task type, risk level
+- model, provider, latency, token counts, estimated cost
+- success/error status
+
+### Step 2 — Run for one week
+
+Events accumulate in `audit.jsonl` on disk. No server required.
+
+### Step 3 — Export and upload
+
+```python
+from gradient_sdk.exporters import load_jsonl, export_phase1_csv
+
+events = load_jsonl("audit.jsonl")
+export_phase1_csv(events, "upload.csv")
+# Upload upload.csv to Gradient → runs the Phase 1 audit engine
+```
+
+> **Limitation:** metadata-only exports produce Phase 1 spend and task-type analysis, but **cannot be replayed**. The replay engine needs actual prompt and response content. When you're ready for replay, add `capture_prompt=True, capture_response=True` to the `@audit` decorator and upload a new batch.
+
+Or send events directly to the Gradient API (cloud mode):
+
+```python
+client = GradientClient(api_key="...", mode="cloud", api_url="https://your-gradient-instance")
+```
+
+Events are batched and sent to `POST /sdk/events`.
+
+### Customer adoption path
+
+| Step | Action | Time |
+|------|--------|------|
+| 1 | Install SDK, add `@audit` to 1–2 AI workflows | 10 min |
+| 2 | Run metadata-only for one week | 1 week |
+| 3 | Export and run procurement audit | 30 min |
+| 4 | Identify low-risk workloads for replay | 1 hour |
+| 5 | Validate migration with replay engine | 1–2 days |
+| 6 | Run controlled pilot on 10–20% of traffic | 2 weeks |
+| 7 | Full migration with production evidence | ongoing |
+
+### SDK modes
+
+| Mode | Behavior |
+|------|----------|
+| `local` | Appends events to a local JSONL file |
+| `cloud` | Batches and sends events to the Gradient API |
+| `dry_run` | Logs what would be captured (no writes) |
+| `disabled` | No-op — zero overhead |
+
+### Adding content capture (opt-in)
+
+Once your team is comfortable with metadata-only, opt in to content capture per workflow:
+
+```python
+@audit(
+    client=client,
+    workflow="summarizer",
+    task_type="summarization",
+    capture_prompt=True,    # opt-in
+    capture_response=True,  # opt-in
+    redact=True,            # redact PII before storage (default)
+)
+def summarize(text: str) -> str:
+    ...
+```
+
+Redaction removes emails, phone numbers, API keys, and long numeric strings automatically. See `gradient_sdk/redaction.py` for the full list and how to add custom patterns.
+
+### Feedback signals
+
+```python
+client.log_feedback(
+    event_id="...",
+    feedback_score=1.0,
+    feedback_label="accepted",
+    notes="User accepted the AI response",
+)
+```
+
+Feedback is stored alongside audit events and feeds future quality and ROI analysis.
+
+### Examples
+
+See `examples/` for runnable demos:
+
+- `examples/sdk_metadata_only.py` — recommended starting point
+- `examples/sdk_basic_usage.py` — explicit provider/model, dry_run mode
+- `examples/sdk_capture_with_redaction.py` — prompt/response capture with PII redaction
+- `examples/sdk_local_export.py` — load JSONL, export to Phase 1 CSV

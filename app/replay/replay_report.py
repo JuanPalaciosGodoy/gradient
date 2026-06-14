@@ -7,10 +7,11 @@ ScenarioOutcome / ExecutiveReplayReport — executive-level migration analysis.
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.replay.migration_simulator import simulate_from_replay_data
 from app.replay.replay_models import MigrationSimulationResult, ReplayRequest, ReplayResult
+from app.schemas import EvidenceLevel, ValidationStatus
 
 
 # ── Per-model replay summary ──────────────────────────────────────────────────
@@ -117,10 +118,18 @@ class ScenarioOutcome(BaseModel):
     quality_loss_pct: float     # positive = quality deteriorated (0 = no loss)
     avg_quality_delta: float    # signed; negative = candidate worse than original
     avg_latency_ms: float
-    confidence_pct: int         # 0–100
+    confidence_pct: int = Field(default=0, ge=0, le=100)
     recommendation: str
     rationale: str
     records_analyzed: int
+    # Phase 2.5 evidence fields — conservative by default
+    evidence_level: EvidenceLevel = EvidenceLevel.HEURISTIC
+    evidence_summary: str = ""
+    limitations: list[str] = Field(default_factory=list)
+    validation_status: ValidationStatus = ValidationStatus.NOT_VALIDATED
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_coverage_pct: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ExecutiveReplayReport(BaseModel):
@@ -135,6 +144,8 @@ class ExecutiveReplayReport(BaseModel):
     overall_confidence: int          # 0–100
     executive_summary: str
     recommended_migrations: list[ScenarioOutcome]
+    investigate_scenarios: list[ScenarioOutcome] = Field(default_factory=list)
+    hold_scenarios: list[ScenarioOutcome] = Field(default_factory=list)
     do_not_migrate: list[ScenarioOutcome]
     risk_notes: list[str]
     next_actions: list[str]
@@ -171,6 +182,32 @@ def _sim_to_outcome(sim: MigrationSimulationResult) -> ScenarioOutcome:
         recommendation=sim.recommendation,
         rationale=sim.rationale,
         records_analyzed=sim.records_analyzed,
+        evidence_level=sim.evidence_level,
+        evidence_summary=sim.evidence_summary,
+        limitations=sim.limitations,
+        validation_status=sim.validation_status,
+        confidence_score=sim.confidence_score,
+        evidence_coverage_pct=sim.evidence_coverage_pct,
+        evidence_counts=sim.evidence_counts,
+    )
+
+
+def _evidence_method_description(simulations: list[MigrationSimulationResult]) -> str:
+    """One-sentence description of the evidence tier(s) present in this report."""
+    from app.schemas import EvidenceLevel
+    levels = {s.evidence_level for s in simulations}
+    if EvidenceLevel.HUMAN_REVIEWED in levels:
+        return "Quality scores are validated by human reviewers (highest evidence)."
+    if EvidenceLevel.LLM_JUDGE in levels:
+        return "Quality scores are validated by an LLM judge model."
+    if EvidenceLevel.OBSERVED_REPLAY in levels:
+        return (
+            "Quality scores are derived from heuristic-evaluated replay results. "
+            "Use LLM judge or human review to upgrade to higher evidence levels."
+        )
+    return (
+        "Findings are heuristic estimates. "
+        "Run the replay engine to obtain observed-replay evidence."
     )
 
 
@@ -190,13 +227,22 @@ def _executive_summary(
         f"Gradient analyzed {total_requests} historical prompt(s) across "
         f"{len(simulations)} migration scenario(s).",
         f"At current run rate, annualized spend is ${current_annualized:,.2f}.",
+        _evidence_method_description(simulations),
     ]
+
+    any_positive_savings = any(s.estimated_annual_savings > 0 for s in simulations)
 
     if best_savings > 0:
         parts.append(
             f"Evidence-based replay simulation identifies ${best_savings:,.2f}/yr in "
             f"potential savings ({savings_rate:.0%} of current spend) "
             f"with {overall_confidence}% confidence."
+        )
+    elif any_positive_savings:
+        parts.append(
+            "Replay found potential cost reductions, but none currently meet Gradient's "
+            "quality and confidence thresholds for migration. Expand replay coverage or "
+            "test higher-quality candidate models."
         )
     else:
         parts.append("No cost savings were identified in the tested migration scenarios.")
@@ -314,6 +360,8 @@ def build_executive_replay_report_from_simulations(
     )
 
     recommended = [s for s in simulations if s.recommendation in ("migrate", "controlled_pilot")]
+    investigate = [s for s in simulations if s.recommendation == "investigate"]
+    hold = [s for s in simulations if s.recommendation == "hold"]
     do_not_migrate = [s for s in simulations if s.recommendation == "no_migration"]
 
     return ExecutiveReplayReport(
@@ -334,6 +382,8 @@ def build_executive_replay_report_from_simulations(
             total_requests=total_requests,
         ),
         recommended_migrations=[_sim_to_outcome(s) for s in recommended],
+        investigate_scenarios=[_sim_to_outcome(s) for s in investigate],
+        hold_scenarios=[_sim_to_outcome(s) for s in hold],
         do_not_migrate=[_sim_to_outcome(s) for s in do_not_migrate],
         risk_notes=_risk_notes(simulations),
         next_actions=_next_actions(simulations),

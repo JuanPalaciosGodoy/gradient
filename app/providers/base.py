@@ -34,6 +34,12 @@ class ProviderResponse:
     input_tokens: int
     output_tokens: int
     estimated_cost: float
+    provider: str = ""
+    model: str = ""
+    # "observed" = measured from real API; "estimated_catalog" = computed from token counts + pricing;
+    # "fake" = deterministic fake; "missing" = error path
+    cost_source: str = "estimated_catalog"
+    latency_source: str = "fake"
     raw_response: Optional[dict] = field(default=None)
 
 

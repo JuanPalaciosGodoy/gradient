@@ -4,13 +4,32 @@ Migration simulator: two modes.
 1. simulate_migration — Phase 1 heuristic using catalog pricing ratios.
 2. simulate_from_replay_data — Phase 2 evidence-based using actual replay results.
 """
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 
 from app.audit.model_catalog import CATALOG, get_quality_tier
 from app.replay.replay_models import MigrationScenario, MigrationSimulationResult
-from app.schemas import UsageRecord
+from app.schemas import EvidenceLevel, UsageRecord, ValidationStatus
 from app.utils.date_range import calculate_date_range_days  # noqa: F401 — re-exported
+from app.utils.evidence import adjust_confidence_for_evidence
+
+# Rank ordering for evidence level and validation status — higher = stronger
+_EVIDENCE_RANK: dict[str, int] = {
+    "heuristic": 0,
+    "estimated": 1,
+    "observed_replay": 2,
+    "llm_judge": 3,
+    "human_reviewed": 4,
+    "production_validated": 5,
+}
+_VALIDATION_RANK: dict[str, int] = {
+    "not_validated": 0,
+    "replayed": 1,
+    "evaluator_scored": 2,
+    "human_reviewed": 3,
+    "ready_for_pilot": 4,
+    "production_validated": 5,
+}
 
 
 # Quality tier ordering: lower index = higher quality
@@ -112,13 +131,141 @@ def simulate_migration(
         estimated_annual_savings=round(estimated_annual_savings, 2),
         estimated_savings_pct=round(estimated_savings_pct, 2),
         average_quality_delta=average_quality_delta,
-        confidence_score=confidence,
+        base_confidence_score=confidence,
+        confidence_score=adjust_confidence_for_evidence(
+            confidence, EvidenceLevel.ESTIMATED, ValidationStatus.NOT_VALIDATED
+        ),
         recommendation=recommendation,
         rationale=rationale,
+        evidence_level=EvidenceLevel.ESTIMATED,
+        evidence_summary=(
+            f"Catalog-based estimate using pricing ratios. {len(matching)} historical "
+            f"request(s) on {scenario.source_model} analyzed. Cost ratio: {cost_ratio:.2f}x. "
+            "No replay data used."
+        ),
+        limitations=[
+            "Savings estimated from catalog pricing ratios, not live API pricing.",
+            "Quality delta estimated from model tier difference, not measured from real outputs.",
+            "Migration percentage is a user-defined assumption, not observed behavior.",
+        ],
+        validation_status=ValidationStatus.NOT_VALIDATED,
     )
 
 
 # ── Evidence-based simulation ─────────────────────────────────────────────────
+
+_PROMOTION_THRESHOLD = 0.80  # fraction of results that must be at/above a level to claim it
+
+_EVIDENCE_LABEL: dict[str, str] = {
+    "production_validated": "production-validated",
+    "human_reviewed": "human-reviewed",
+    "llm_judge": "LLM-judged",
+    "observed_replay": "evaluator-scored",
+    "estimated": "estimated",
+    "heuristic": "heuristic",
+}
+
+
+def _derive_scenario_evidence(
+    results: list[dict],
+) -> tuple[EvidenceLevel, ValidationStatus, float, dict[str, int], float, str]:
+    """Coverage-aware evidence promotion for a scenario result group.
+
+    Returns:
+        evidence_level      — claimed level (only promoted when ≥80% of results qualify)
+        validation_status   — status matching the claimed level
+        coverage_pct        — fraction of results at or above the claimed level
+        evidence_counts     — raw count per evidence level key
+        partial_higher_pct  — fraction above the claimed level (non-zero only when level is
+                              OBSERVED_REPLAY and partial higher-evidence data exists)
+        evidence_summary    — human-readable coverage breakdown string
+    """
+    total = len(results)
+    counts: Counter[str] = Counter(r.get("evidence_level") or "observed_replay" for r in results)
+
+    def _frac_at_or_above(min_rank: int) -> float:
+        if total == 0:
+            return 0.0
+        return sum(
+            cnt for lvl, cnt in counts.items()
+            if _EVIDENCE_RANK.get(lvl, 0) >= min_rank
+        ) / total
+
+    pv_frac = _frac_at_or_above(_EVIDENCE_RANK["production_validated"])
+    hr_frac = _frac_at_or_above(_EVIDENCE_RANK["human_reviewed"])
+    lj_frac = _frac_at_or_above(_EVIDENCE_RANK["llm_judge"])
+    obs_frac = _frac_at_or_above(_EVIDENCE_RANK["observed_replay"])
+
+    if pv_frac >= _PROMOTION_THRESHOLD:
+        level = EvidenceLevel.PRODUCTION_VALIDATED
+        status = ValidationStatus.PRODUCTION_VALIDATED
+        coverage_pct = pv_frac
+        partial_higher_pct = 0.0
+    elif hr_frac >= _PROMOTION_THRESHOLD:
+        level = EvidenceLevel.HUMAN_REVIEWED
+        status = ValidationStatus.HUMAN_REVIEWED
+        coverage_pct = hr_frac
+        partial_higher_pct = 0.0
+    elif lj_frac >= _PROMOTION_THRESHOLD:
+        level = EvidenceLevel.LLM_JUDGE
+        status = ValidationStatus.EVALUATOR_SCORED
+        coverage_pct = lj_frac
+        partial_higher_pct = 0.0
+    else:
+        level = EvidenceLevel.OBSERVED_REPLAY
+        status = ValidationStatus.EVALUATOR_SCORED
+        coverage_pct = obs_frac
+        # Fraction above observed_replay — used for a small confidence boost
+        partial_higher_pct = lj_frac
+
+    summary = _build_evidence_summary(counts, total, level)
+    return level, status, coverage_pct, dict(counts), partial_higher_pct, summary
+
+
+def _build_evidence_summary(
+    counts: Counter,
+    total: int,
+    level: EvidenceLevel,
+) -> str:
+    parts = [
+        f"{counts[lvl]} {_EVIDENCE_LABEL.get(lvl, lvl)}"
+        for lvl in ("production_validated", "human_reviewed", "llm_judge", "observed_replay", "heuristic", "estimated")
+        if counts.get(lvl)
+    ]
+    breakdown = ", ".join(parts) if parts else f"{total} replayed"
+    base = f"{total} replayed: {breakdown}."
+
+    if level == EvidenceLevel.OBSERVED_REPLAY:
+        hr = counts.get("human_reviewed", 0) + counts.get("production_validated", 0)
+        lj = counts.get("llm_judge", 0)
+        if hr > 0:
+            pct = round(hr / total * 100) if total else 0
+            base += f" Scenario remains replay-validated; human review coverage is {pct}% (threshold: 80%)."
+        elif lj > 0:
+            pct = round(lj / total * 100) if total else 0
+            base += f" Scenario remains replay-validated; LLM-judge coverage is {pct}% (threshold: 80%)."
+
+    return base
+
+
+def _compute_sim_confidence(
+    base_score: float,
+    evidence_level: EvidenceLevel,
+    validation_status: ValidationStatus,
+    partial_higher_pct: float,
+) -> float:
+    """Evidence-adjusted confidence with a small linear boost for partial higher coverage.
+
+    When the scenario stays at OBSERVED_REPLAY because the 80% threshold was not met,
+    but some fraction of results have higher-quality evidence, we add up to +3pp to
+    acknowledge that signal without overclaiming full promotion.
+    """
+    adj = adjust_confidence_for_evidence(base_score, evidence_level, validation_status)
+    if partial_higher_pct > 0 and evidence_level == EvidenceLevel.OBSERVED_REPLAY:
+        boost = 0.03 * partial_higher_pct
+        adj = min(round(adj + boost, 4), 0.95)
+    return adj
+
 
 def _safe_mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
@@ -294,6 +441,7 @@ def simulate_from_replay_data(
                 estimated_annual_savings=0.0,
                 estimated_savings_pct=0.0,
                 average_quality_delta=0.0,
+                base_confidence_score=0.0,
                 confidence_score=0.0,
                 recommendation="investigate",
                 rationale=(
@@ -305,6 +453,13 @@ def simulate_from_replay_data(
                 avg_latency_delta_ms=0.0,
                 records_analyzed=0,
                 failed_replays=len(failed),
+                evidence_level=EvidenceLevel.HEURISTIC,
+                evidence_summary=(
+                    f"All {len(failed)} replay attempt(s) failed. "
+                    "No usable quality or cost data was produced."
+                ),
+                limitations=["All replays failed; cannot assess cost savings or quality impact."],
+                validation_status=ValidationStatus.NOT_VALIDATED,
             ))
             continue
 
@@ -350,6 +505,24 @@ def simulate_from_replay_data(
             records_analyzed=len(successful),
         )
 
+        # Derive coverage-aware scenario evidence from the actual replay results in this group
+        successful_rr = [p["result"] for p in successful]
+        evidence_level, validation_status, coverage_pct, ev_counts, partial_higher_pct, ev_summary = (
+            _derive_scenario_evidence(successful_rr)
+        )
+
+        failed_note = (
+            [f"{len(failed)} of {len(successful) + len(failed)} replay(s) failed and were excluded."]
+            if failed else []
+        )
+
+        if evidence_level == EvidenceLevel.HUMAN_REVIEWED:
+            quality_note = "Quality validated by human reviewers."
+        elif evidence_level == EvidenceLevel.LLM_JUDGE:
+            quality_note = "Quality validated by LLM judge; human review may differ."
+        else:
+            quality_note = "Quality scored by heuristic evaluator; human review may yield different results."
+
         simulations.append(MigrationSimulationResult(
             scenario_name=f"{source_model}→{target_model}:{task_type}",
             source_model=source_model,
@@ -359,7 +532,10 @@ def simulate_from_replay_data(
             estimated_annual_savings=round(savings, 2),
             estimated_savings_pct=round(savings_pct, 2),
             average_quality_delta=round(avg_quality_delta, 4),
-            confidence_score=confidence,
+            base_confidence_score=confidence,
+            confidence_score=_compute_sim_confidence(
+                confidence, evidence_level, validation_status, partial_higher_pct
+            ),
             recommendation=recommendation,
             rationale=rationale,
             avg_current_quality=round(avg_current_quality, 4),
@@ -367,6 +543,21 @@ def simulate_from_replay_data(
             avg_latency_delta_ms=round(avg_latency, 2),
             records_analyzed=len(successful),
             failed_replays=len(failed),
+            evidence_level=evidence_level,
+            evidence_summary=(
+                ev_summary + f" "
+                f"Avg quality: {avg_simulated_quality:.2f} vs. baseline 1.00 "
+                f"({quality_loss_pct:.1f}% loss). "
+                f"Estimated savings: ${savings:,.2f}/yr."
+            ),
+            limitations=[
+                quality_note,
+                f"Based on {len(successful)} request sample; larger samples improve confidence.",
+                "Latency measured in test conditions; production latency may vary.",
+            ] + failed_note,
+            validation_status=validation_status,
+            evidence_coverage_pct=round(coverage_pct, 4),
+            evidence_counts=ev_counts,
         ))
 
     return sorted(simulations, key=lambda s: -s.estimated_annual_savings)

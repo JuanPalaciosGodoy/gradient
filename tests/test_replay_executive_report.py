@@ -311,3 +311,134 @@ def test_from_simulations_empty_returns_zero_savings():
         current_annualized_spend=1000.0, total_requests=0, total_results=0,
     )
     assert report.estimated_annual_savings == 0.0
+
+
+# ── investigate_scenarios and hold_scenarios ─────────────────────────────────
+
+def test_investigate_scenarios_populated():
+    sims = [_make_sim("gpt-4o", "gpt-4o-mini", "summarization", savings=200.0, recommendation="investigate")]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-inv", simulations=sims,
+        current_annualized_spend=1000.0, total_requests=5, total_results=5,
+    )
+    assert len(report.investigate_scenarios) == 1
+    assert report.investigate_scenarios[0].recommendation == "investigate"
+    assert len(report.recommended_migrations) == 0
+
+
+def test_hold_scenarios_populated():
+    sims = [_make_sim("gpt-4o", "gpt-4o-mini", "coding", savings=-50.0, recommendation="hold")]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-hold", simulations=sims,
+        current_annualized_spend=1000.0, total_requests=5, total_results=5,
+    )
+    assert len(report.hold_scenarios) == 1
+    assert report.hold_scenarios[0].recommendation == "hold"
+
+
+def test_all_scenario_types_routed_correctly():
+    sims = [
+        _make_sim("gpt-4o", "gpt-4o-mini", "summarization", savings=500.0, recommendation="migrate"),
+        _make_sim("gpt-4o", "gpt-4o-mini", "research", savings=100.0, recommendation="investigate"),
+        _make_sim("gpt-4o", "gpt-4o-mini", "coding", savings=-10.0, recommendation="hold"),
+        _make_sim("gpt-4o", "gpt-4o-mini", "classification", savings=0.0, recommendation="no_migration"),
+    ]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-all", simulations=sims,
+        current_annualized_spend=2000.0, total_requests=20, total_results=20,
+    )
+    assert len(report.recommended_migrations) == 1
+    assert len(report.investigate_scenarios) == 1
+    assert len(report.hold_scenarios) == 1
+    assert len(report.do_not_migrate) == 1
+
+
+def test_no_scenarios_silently_dropped():
+    """Every simulation must appear in exactly one list."""
+    sims = [
+        _make_sim("gpt-4o", "gpt-4o-mini", "summarization", savings=300.0, recommendation="controlled_pilot"),
+        _make_sim("gpt-4o", "gpt-4o-mini", "research", savings=150.0, recommendation="investigate"),
+        _make_sim("gpt-4o", "claude-3-haiku-20240307", "coding", savings=-5.0, recommendation="hold"),
+        _make_sim("gpt-4o", "claude-3-haiku-20240307", "extraction", savings=0.0, recommendation="no_migration"),
+    ]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-complete", simulations=sims,
+        current_annualized_spend=2000.0, total_requests=20, total_results=20,
+    )
+    total_routed = (
+        len(report.recommended_migrations)
+        + len(report.investigate_scenarios)
+        + len(report.hold_scenarios)
+        + len(report.do_not_migrate)
+    )
+    assert total_routed == len(sims)
+
+
+# ── Executive summary wording ─────────────────────────────────────────────────
+
+def test_summary_says_no_savings_when_all_scenarios_negative():
+    sims = [_make_sim("gpt-4o", "gpt-4o-mini", "coding", savings=-10.0, recommendation="hold")]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-neg", simulations=sims,
+        current_annualized_spend=1000.0, total_requests=5, total_results=5,
+    )
+    assert "No cost savings were identified" in report.executive_summary
+
+
+def test_summary_distinguishes_savings_found_but_not_migration_ready():
+    """Investigate-only report (positive savings, no migration threshold met) must NOT
+    say 'No cost savings were identified' — that's inaccurate."""
+    sims = [
+        _make_sim("gpt-4o", "gpt-4o-mini", "summarization", savings=400.0, recommendation="investigate")
+    ]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-inv-savings", simulations=sims,
+        current_annualized_spend=1000.0, total_requests=10, total_results=10,
+    )
+    assert "No cost savings were identified" not in report.executive_summary
+    assert "quality and confidence thresholds" in report.executive_summary
+
+
+def test_summary_reports_savings_when_recommended_migration_exists():
+    sims = [_make_sim("gpt-4o", "gpt-4o-mini", "summarization", savings=500.0, recommendation="migrate")]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-rec", simulations=sims,
+        current_annualized_spend=1000.0, total_requests=10, total_results=10,
+    )
+    assert "$500.00/yr" in report.executive_summary
+
+
+# ── Markdown: new sections ────────────────────────────────────────────────────
+
+def test_markdown_has_investigate_section():
+    report = _build_report()
+    md = render_replay_markdown_report(report)
+    assert "## Needs More Evidence / Investigate" in md
+
+
+def test_markdown_has_hold_section():
+    report = _build_report()
+    md = render_replay_markdown_report(report)
+    assert "## Hold / No Savings" in md
+
+
+def test_markdown_investigate_section_shows_scenarios():
+    sims = [_make_sim("gpt-4o", "gpt-4o-mini", "research", savings=200.0, recommendation="investigate")]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-md-inv", simulations=sims,
+        current_annualized_spend=1000.0, total_requests=5, total_results=5,
+    )
+    md = render_replay_markdown_report(report)
+    assert "gpt-4o" in md
+    assert "gpt-4o-mini" in md
+    assert "No scenarios require further investigation" not in md
+
+
+def test_markdown_hold_section_shows_scenarios():
+    sims = [_make_sim("gpt-4o", "gpt-4o-mini", "other", savings=-5.0, recommendation="hold")]
+    report = build_executive_replay_report_from_simulations(
+        replay_run_id="run-md-hold", simulations=sims,
+        current_annualized_spend=1000.0, total_requests=5, total_results=5,
+    )
+    md = render_replay_markdown_report(report)
+    assert "No scenarios are on hold" not in md

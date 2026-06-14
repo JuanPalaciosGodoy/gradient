@@ -7,6 +7,26 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+class EvidenceLevel(str, Enum):
+    """How a finding was derived — used across opportunities, replay results, and simulations."""
+    HEURISTIC = "heuristic"
+    ESTIMATED = "estimated"
+    OBSERVED_REPLAY = "observed_replay"
+    LLM_JUDGE = "llm_judge"
+    HUMAN_REVIEWED = "human_reviewed"
+    PRODUCTION_VALIDATED = "production_validated"
+
+
+class ValidationStatus(str, Enum):
+    """The validation state of a finding or recommendation."""
+    NOT_VALIDATED = "not_validated"
+    REPLAYED = "replayed"
+    EVALUATOR_SCORED = "evaluator_scored"
+    HUMAN_REVIEWED = "human_reviewed"
+    READY_FOR_PILOT = "ready_for_pilot"
+    PRODUCTION_VALIDATED = "production_validated"
+
+
 class TaskType(str, Enum):
     SUMMARIZATION = "summarization"
     CLASSIFICATION = "classification"
@@ -86,6 +106,12 @@ class Opportunity(BaseModel):
     confidence: float
     rationale: str
     recommended_action: str
+    # Phase 2.5 evidence fields
+    evidence_level: EvidenceLevel = EvidenceLevel.HEURISTIC
+    evidence_summary: str = ""
+    limitations: list[str] = Field(default_factory=list)
+    validation_status: ValidationStatus = ValidationStatus.NOT_VALIDATED
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class RiskNote(BaseModel):
@@ -135,7 +161,7 @@ class ReplayRunRequest(BaseModel):
     candidate_models: Optional[list[str]] = None  # None = all enabled candidates
     task_types: Optional[list[str]] = None         # None = all task types
     max_records: Optional[int] = Field(default=None, ge=1)
-    evaluator_mode: Literal["heuristic"] = "heuristic"
+    evaluator_mode: Literal["heuristic", "exact_match", "task_router", "llm_judge"] = "heuristic"
 
 
 class ReplayRunResponse(BaseModel):
@@ -149,7 +175,11 @@ class SimulationTopRecommendation(BaseModel):
     scenario_name: str
     recommendation: str
     estimated_annual_savings: float
-    confidence_pct: int
+    confidence_pct: int = Field(default=0, ge=0, le=100)
+    evidence_level: EvidenceLevel = EvidenceLevel.HEURISTIC
+    evidence_summary: str = ""
+    validation_status: ValidationStatus = ValidationStatus.NOT_VALIDATED
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class SimulationResponse(BaseModel):

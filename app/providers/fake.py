@@ -75,4 +75,8 @@ class FakeProvider(GenerationProvider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             estimated_cost=round(estimated_cost, 8),
+            provider="fake",
+            model=model,
+            cost_source="estimated_catalog",
+            latency_source="fake",
         )

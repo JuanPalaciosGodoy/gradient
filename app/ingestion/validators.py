@@ -3,11 +3,27 @@ from pydantic import ValidationError
 
 from app.schemas import TaskType, UsageRecord
 
+METADATA_ONLY_SENTINEL = "[metadata_only]"
+
 
 def validate_columns(present: set[str], required: set[str]) -> None:
     missing = required - present
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
+
+
+def _clean_text_field(val) -> str:
+    """Return val as a string; replace NaN/empty/None with the metadata-only sentinel.
+
+    This prevents pandas NaN values from becoming the literal string "nan" when
+    prompt or response columns are blank (e.g. metadata-only SDK exports).
+    """
+    if val is None:
+        return METADATA_ONLY_SENTINEL
+    if isinstance(val, float) and pd.isna(val):
+        return METADATA_ONLY_SENTINEL
+    s = str(val).strip()
+    return s if s else METADATA_ONLY_SENTINEL
 
 
 def validate_row(row: pd.Series, idx: int) -> UsageRecord:
@@ -44,8 +60,8 @@ def validate_row(row: pd.Series, idx: int) -> UsageRecord:
 
     try:
         return UsageRecord(
-            prompt=str(row["prompt"]),
-            response=str(row["response"]),
+            prompt=_clean_text_field(row["prompt"]),
+            response=_clean_text_field(row["response"]),
             timestamp=dt,
             model=str(row["model"]).strip(),
             cost=cost,

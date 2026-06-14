@@ -38,6 +38,27 @@ def _run_lightweight_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "migration_simulations", "avg_latency_delta_ms", "REAL NOT NULL DEFAULT 0.0")
     _ensure_column(conn, "migration_simulations", "records_analyzed", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "migration_simulations", "failed_replays", "INTEGER NOT NULL DEFAULT 0")
+    # Phase 2.5 evidence columns
+    _ensure_column(conn, "migration_simulations", "evidence_level", "TEXT NOT NULL DEFAULT 'heuristic'")
+    _ensure_column(conn, "migration_simulations", "evidence_summary", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "migration_simulations", "validation_status", "TEXT NOT NULL DEFAULT 'not_validated'")
+    _ensure_column(conn, "migration_simulations", "limitations", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "migration_simulations", "base_confidence_score", "REAL NOT NULL DEFAULT 0.0")
+    _ensure_column(conn, "replay_results", "evidence_level", "TEXT NOT NULL DEFAULT 'heuristic'")
+    _ensure_column(conn, "replay_results", "evidence_summary", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "replay_results", "validation_status", "TEXT NOT NULL DEFAULT 'not_validated'")
+    _ensure_column(conn, "replay_results", "limitations", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "replay_results", "confidence_score", "REAL NOT NULL DEFAULT 0.0")
+    # Phase 2.5 cost/latency provenance columns
+    _ensure_column(conn, "replay_results", "input_tokens", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "replay_results", "output_tokens", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "replay_results", "cost_source", "TEXT NOT NULL DEFAULT 'estimated_catalog'")
+    _ensure_column(conn, "replay_results", "latency_source", "TEXT NOT NULL DEFAULT 'fake'")
+    # Coverage-aware evidence policy
+    _ensure_column(conn, "migration_simulations", "evidence_coverage_pct", "REAL NOT NULL DEFAULT 0.0")
+    _ensure_column(conn, "migration_simulations", "evidence_counts", "TEXT NOT NULL DEFAULT '{}'")
+    # SDK events feedback notes
+    _ensure_column(conn, "sdk_events", "notes", "TEXT")
 
 
 def init_db() -> None:
@@ -100,7 +121,26 @@ def init_db() -> None:
                 quality_confidence REAL NOT NULL DEFAULT 1.0,
                 quality_flags TEXT NOT NULL DEFAULT '[]',
                 error_message TEXT,
+                evidence_level TEXT NOT NULL DEFAULT 'heuristic',
+                evidence_summary TEXT NOT NULL DEFAULT '',
+                validation_status TEXT NOT NULL DEFAULT 'not_validated',
+                limitations TEXT NOT NULL DEFAULT '[]',
+                confidence_score REAL NOT NULL DEFAULT 0.0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_source TEXT NOT NULL DEFAULT 'estimated_catalog',
+                latency_source TEXT NOT NULL DEFAULT 'fake',
                 FOREIGN KEY (replay_run_id) REFERENCES replay_runs(replay_run_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS human_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                replay_run_id TEXT NOT NULL,
+                replay_id TEXT NOT NULL UNIQUE,
+                reviewer_label TEXT NOT NULL,
+                reviewer_notes TEXT NOT NULL DEFAULT '',
+                reviewed_at TEXT NOT NULL
             )
         """)
         conn.execute("""
@@ -117,14 +157,53 @@ def init_db() -> None:
                 estimated_annual_savings REAL NOT NULL,
                 estimated_savings_pct REAL NOT NULL,
                 average_quality_delta REAL NOT NULL,
-                confidence_score REAL NOT NULL,
+                base_confidence_score REAL NOT NULL DEFAULT 0.0,
+                confidence_score REAL NOT NULL DEFAULT 0.0,
                 recommendation TEXT NOT NULL,
                 rationale TEXT NOT NULL,
                 avg_current_quality REAL NOT NULL DEFAULT 0.0,
                 avg_simulated_quality REAL NOT NULL DEFAULT 0.0,
                 avg_latency_delta_ms REAL NOT NULL DEFAULT 0.0,
                 records_analyzed INTEGER NOT NULL DEFAULT 0,
-                failed_replays INTEGER NOT NULL DEFAULT 0
+                failed_replays INTEGER NOT NULL DEFAULT 0,
+                evidence_level TEXT NOT NULL DEFAULT 'heuristic',
+                evidence_summary TEXT NOT NULL DEFAULT '',
+                validation_status TEXT NOT NULL DEFAULT 'not_validated',
+                limitations TEXT NOT NULL DEFAULT '[]',
+                evidence_coverage_pct REAL NOT NULL DEFAULT 0.0,
+                evidence_counts TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sdk_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                received_at TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                workflow TEXT NOT NULL DEFAULT '',
+                task_type TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'success',
+                latency_ms REAL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                estimated_cost REAL,
+                error_message TEXT,
+                user_id_hash TEXT,
+                team TEXT,
+                business_unit TEXT,
+                process_name TEXT,
+                tool_name TEXT,
+                environment TEXT,
+                risk_level TEXT,
+                value_metric_name TEXT,
+                value_metric_value REAL,
+                feedback_score REAL,
+                feedback_label TEXT,
+                notes TEXT,
+                prompt TEXT,
+                response TEXT
             )
         """)
         _run_lightweight_migrations(conn)
@@ -232,3 +311,69 @@ def get_report(audit_run_id: str):
         if row is None:
             return None
         return AuditReport.model_validate_json(row["report_json"])
+
+
+def save_human_review(
+    replay_run_id: str,
+    replay_id: str,
+    reviewer_label: str,
+    reviewer_notes: str,
+    reviewed_at: str,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO human_reviews
+               (replay_run_id, replay_id, reviewer_label, reviewer_notes, reviewed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (replay_run_id, replay_id, reviewer_label, reviewer_notes, reviewed_at),
+        )
+
+
+def get_human_reviews_for_run(replay_run_id: str) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM human_reviews WHERE replay_run_id = ?",
+            (replay_run_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_replay_result_evidence(
+    replay_id: str,
+    replay_run_id: str,
+    evidence_level: str,
+    validation_status: str,
+    confidence_score: float,
+) -> None:
+    """Update evidence fields on a replay result, scoped to its replay run.
+
+    The replay_run_id guard prevents a review CSV from one run from modifying
+    results that belong to a different run, even if the replay_id matches.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE replay_results
+               SET evidence_level = ?, validation_status = ?, confidence_score = ?
+               WHERE replay_id = ? AND replay_run_id = ?""",
+            (evidence_level, validation_status, confidence_score, replay_id, replay_run_id),
+        )
+
+
+def get_latest_simulation_created_at(replay_run_id: str) -> str | None:
+    """Return the ISO timestamp of the most recently created simulation for a run, or None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT MAX(created_at) FROM migration_simulations WHERE replay_run_id = ?",
+            (replay_run_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+
+def get_latest_human_review_time(replay_run_id: str) -> str | None:
+    """Return the ISO timestamp of the most recent human review for a run, or None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT MAX(reviewed_at) FROM human_reviews WHERE replay_run_id = ?",
+            (replay_run_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else None

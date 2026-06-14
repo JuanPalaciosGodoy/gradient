@@ -9,6 +9,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.schemas import EvidenceLevel, ValidationStatus
+
 
 class ReplayCandidate(BaseModel):
     """A model that is a candidate for replacing the original model in a replay."""
@@ -65,12 +67,46 @@ class ReplayResult(BaseModel):
     quality_confidence: float = 1.0
     quality_flags: list[str] = Field(default_factory=list)
     error_message: Optional[str] = None
+    # Cost and latency provenance
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_source: str = "estimated_catalog"   # observed | estimated_catalog | fake | missing
+    latency_source: str = "fake"             # observed | fake | missing
+    # Phase 2.5 evidence fields — conservative by default; success path sets stronger evidence
+    evidence_level: EvidenceLevel = EvidenceLevel.HEURISTIC
+    evidence_summary: str = ""
+    limitations: list[str] = Field(default_factory=list)
+    validation_status: ValidationStatus = ValidationStatus.NOT_VALIDATED
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
 
     @field_validator("quality_score", "quality_confidence")
     @classmethod
     def must_be_in_unit_range(cls, v: float) -> float:
         if not 0.0 <= v <= 1.0:
             raise ValueError("must be between 0.0 and 1.0")
+        return v
+
+    @field_validator("input_tokens", "output_tokens")
+    @classmethod
+    def tokens_must_be_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("must be non-negative")
+        return v
+
+    @field_validator("cost_source")
+    @classmethod
+    def cost_source_must_be_valid(cls, v: str) -> str:
+        valid = {"observed", "estimated_catalog", "fake", "missing"}
+        if v not in valid:
+            raise ValueError(f"must be one of {sorted(valid)}")
+        return v
+
+    @field_validator("latency_source")
+    @classmethod
+    def latency_source_must_be_valid(cls, v: str) -> str:
+        valid = {"observed", "fake", "missing"}
+        if v not in valid:
+            raise ValueError(f"must be one of {sorted(valid)}")
         return v
 
 
@@ -106,7 +142,8 @@ class MigrationSimulationResult(BaseModel):
     estimated_annual_savings: float
     estimated_savings_pct: float      # 0–100
     average_quality_delta: float      # negative = quality loss; positive = quality gain
-    confidence_score: float           # 0.0–1.0
+    base_confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)  # raw algorithm score
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)       # evidence-adjusted
     recommendation: str               # migrate | controlled_pilot | no_migration | hold | investigate | proceed
     rationale: str
     # Evidence-based fields (populated by simulate_from_replay_data; default 0 for catalog-based)
@@ -115,6 +152,13 @@ class MigrationSimulationResult(BaseModel):
     avg_latency_delta_ms: float = 0.0   # average candidate latency (original latency not tracked)
     records_analyzed: int = 0
     failed_replays: int = 0
+    # Phase 2.5 evidence fields
+    evidence_level: EvidenceLevel = EvidenceLevel.HEURISTIC
+    evidence_summary: str = ""
+    limitations: list[str] = Field(default_factory=list)
+    validation_status: ValidationStatus = ValidationStatus.NOT_VALIDATED
+    evidence_coverage_pct: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_counts: dict[str, int] = Field(default_factory=dict)
 
 
 # ── Candidate catalog ─────────────────────────────────────────────────────────
